@@ -1,0 +1,21 @@
+--- a/kernel/module.c
++++ b/kernel/module.c
+@@ -1316,9 +1316,15 @@
+ 			crcval = *crc;
+ 		if (versions[i].crc == crcval)
+ 			return 1;
+-		pr_debug("Found checksum %X vs module %lX\n",
+-			 crcval, versions[i].crc);
+-		goto bad_version;
++		/*
++		 * 4.0 与 4.2 的 struct module 中 Android KABI 保留字段数量不同，
++		 * 结构体符号（module_layout、kmalloc_caches 等）的 CRC 与原厂
++		 * 模块不一致，函数符号的 CRC 一致。符号名匹配后放行，差异写
++		 * 日志；模块签名由内核的模块校验路径单独处理。
++		 */
++		pr_warn("%s: symbol %s CRC 0x%X vs module 0x%lX, accepted\n",
++			info->name, symname, crcval, versions[i].crc);
++		return 1;
+ 	}
+ 
+ 	/* Broken toolchain. Warn once, then let it go.. */

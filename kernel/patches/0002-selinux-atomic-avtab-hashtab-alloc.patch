@@ -1,0 +1,40 @@
+--- a/security/selinux/ss/avtab.c
++++ b/security/selinux/ss/avtab.c
+@@ -72,13 +72,14 @@
+ {
+ 	struct avtab_node *newnode;
+ 	struct avtab_extended_perms *xperms;
+-	newnode = kmem_cache_zalloc(avtab_node_cachep, GFP_KERNEL);
++	/* KernelSU 原地注入策略时持有 policy_rwlock，分配必须走原子路径 */
++	newnode = kmem_cache_zalloc(avtab_node_cachep, GFP_ATOMIC);
+ 	if (newnode == NULL)
+ 		return NULL;
+ 	newnode->key = *key;
+ 
+ 	if (key->specified & AVTAB_XPERMS) {
+-		xperms = kmem_cache_zalloc(avtab_xperms_cachep, GFP_KERNEL);
++		xperms = kmem_cache_zalloc(avtab_xperms_cachep, GFP_ATOMIC);
+ 		if (xperms == NULL) {
+ 			kmem_cache_free(avtab_node_cachep, newnode);
+ 			return NULL;
+@@ -95,7 +96,7 @@
+ 	} else {
+ 		newnode->next = flex_array_get_ptr(h->htable, hvalue);
+ 		if (flex_array_put_ptr(h->htable, hvalue, newnode,
+-				       GFP_KERNEL|__GFP_ZERO)) {
++				       GFP_ATOMIC|__GFP_ZERO)) {
+ 			kmem_cache_free(avtab_node_cachep, newnode);
+ 			return NULL;
+ 		}
+--- a/security/selinux/ss/hashtab.c
++++ b/security/selinux/ss/hashtab.c
+@@ -60,7 +60,8 @@
+ 	if (cur && (h->keycmp(h, key, cur->key) == 0))
+ 		return -EEXIST;
+ 
+-	newnode = kmem_cache_zalloc(hashtab_node_cachep, GFP_KERNEL);
++	/* KernelSU 原地注入策略时持有 policy_rwlock，分配必须走原子路径 */
++	newnode = kmem_cache_zalloc(hashtab_node_cachep, GFP_ATOMIC);
+ 	if (!newnode)
+ 		return -ENOMEM;
+ 	newnode->key = key;

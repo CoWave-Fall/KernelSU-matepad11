@@ -1,0 +1,20 @@
+--- a/arch/Kconfig
++++ b/arch/Kconfig
+@@ -59,7 +59,7 @@
+ config KPROBES
+ 	bool "Kprobes"
+ 	depends on MODULES
+-	depends on HAVE_KPROBES && HUAWEI_KERNEL_DEBUG
++	depends on HAVE_KPROBES
+ 	default y if HUAWEI_KERNEL_DEBUG
+ 	select KALLSYMS
+ 	help
+@@ -185,7 +185,7 @@
+ 
+ config KRETPROBES
+ 	def_bool y
+-	depends on KPROBES && HAVE_KRETPROBES && HUAWEI_KERNEL_DEBUG
++	depends on KPROBES && HAVE_KRETPROBES
+ 	default y if HUAWEI_KERNEL_DEBUG
+ 
+ config USER_RETURN_NOTIFIER

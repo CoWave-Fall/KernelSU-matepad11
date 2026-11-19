@@ -1,0 +1,16 @@
+--- a/drivers/Kconfig
++++ b/drivers/Kconfig
+@@ -303,4 +303,6 @@
+ source "drivers/accesstokenid/Kconfig"
+ 
+ source "drivers/shutdown_wdt/Kconfig"
++
++source "drivers/kernelsu/Kconfig"
+ endmenu
+--- a/drivers/Makefile
++++ b/drivers/Makefile
+@@ -232,3 +232,4 @@
+ obj-$(CONFIG_HUAWEI_PERF_CTRL) += perf_ctrl/
+ obj-$(CONFIG_ACCESS_TOKENID)    += accesstokenid/
+ obj-$(CONFIG_HW_SHUTDOWN_WDT) += shutdown_wdt/
++obj-$(CONFIG_KSU) += kernelsu/

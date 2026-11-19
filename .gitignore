@@ -1,0 +1,23 @@
+# 上游源码与构建产物
+/build/
+/out/
+/logs/
+/kernel/src/
+/ksu/src/
+/toolchain/
+/Code_Opensource/
+
+# 原厂镜像与分区备份
+/dumps/
+*.img
+
+# 华为开源包与许可证清单
+/DBY-W09_*_opensource.tar.gz
+/NOTICE.html
+
+# 本地覆盖与中间文件
+/.env
+/.tmp/
+__pycache__/
+*.pyc
+.DS_Store

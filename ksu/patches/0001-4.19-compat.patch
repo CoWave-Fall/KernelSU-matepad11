@@ -1,0 +1,4037 @@
+diff --git a/kernel/core/init.c b/kernel/core/init.c
+index 0ca7529f..cc9414b3 100644
+--- a/kernel/core/init.c
++++ b/kernel/core/init.c
+@@ -242,8 +242,10 @@ module_exit(kernelsu_exit);
+ MODULE_LICENSE("GPL");
+ MODULE_AUTHOR("weishu");
+ MODULE_DESCRIPTION("Android KernelSU");
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 4, 0)
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 13, 0)
+ MODULE_IMPORT_NS("VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver");
+ #else
+ MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver);
+ #endif
++#endif
+diff --git a/kernel/feature/selinux_hide.c b/kernel/feature/selinux_hide.c
+index 459f99f9..29d170fe 100644
+--- a/kernel/feature/selinux_hide.c
++++ b/kernel/feature/selinux_hide.c
+@@ -1,4 +1,7 @@
+ #include "selinux_hide.h"
++#include <linux/version.h>
++
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
+ #include "infra/symbol_resolver.h"
+ #include "linux/jump_label.h"
+ #include "linux/rcupdate.h"
+@@ -1255,3 +1258,1126 @@ allow:
+     avd->allowed = 0xffffffff;
+     goto out;
+ }
++#else /* LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0) */
++#include "infra/symbol_resolver.h"
++#include <linux/cred.h>
++#include <linux/fs.h>
++#include <linux/gfp.h>
++#include <linux/init.h>
++#include <linux/jump_label.h>
++#include <linux/kallsyms.h>
++#include <linux/mm.h>
++#include <linux/mutex.h>
++#include <linux/ptrace.h>
++#include <linux/sched.h>
++#include <linux/slab.h>
++#include <linux/string.h>
++#include "ss/conditional.h"
++#include "ss/context.h"
++#include "ss/mls.h"
++#include "ss/policydb.h"
++#include "ss/services.h"
++#include "ss/sidtab.h"
++#include "avc.h"
++#include "objsec.h"
++#include "security.h"
++#include "klog.h" // IWYU pragma: keep
++#include "hook/lsm_hook.h"
++#include "hook/patch_memory.h"
++#include "ksu.h"
++#include "policy/feature.h"
++#include "selinux/sepolicy.h"
++
++/*
++ * 4.19 的 SELinux 没有 struct selinux_policy：策略与 sidtab 常驻
++ * selinux_state.ss，KSU 的规则由 apply_kernelsu_rules() 原地注入。为了让普通
++ * 应用看不到这些注入，这里保留注入前的策略快照 backup_sepolicy，凡来自应用
++ * （uid >= 10000）的上下文校验与访问判定都改由快照回答。
++ *
++ * 快照的 sidtab 与线上 sidtab 各自独立编号，快照 sid 只在快照内部有效；
++ * setprocattr 需要真正切入的域时，再用线上策略解析一次取线上 sid。
++ *
++ * 与 5.10 实现的差异：
++ *   - 4.19 没有 sidtab_search_entry()/sidtab_sid2str_*()，改用 sidtab_search()
++ *     后每回直接序列化上下文，不做字符串缓存；
++ *   - sidtab_context_to_sid() 依赖 context->hash，转 sid 之前必须
++ *     context_add_hash()；
++ *   - type_attr_map_array / type_val_to_struct_array 是 flex_array；
++ *   - 状态页与状态锁在 selinux_state.ss 下。
++ */
++
++static DEFINE_MUTEX(selinux_hide_mutex);
++static bool ksu_selinux_hide_enabled __read_mostly = false;
++static bool ksu_selinux_hide_running __read_mostly = false;
++
++typedef ssize_t (*write_op_fn)(struct file *, char *, size_t);
++
++static write_op_fn *context_write, *access_write;
++static write_op_fn orig_context_write, orig_access_write;
++
++static DEFINE_STATIC_KEY_FALSE(fake_status_initialize_key);
++static struct page *fake_status = NULL;
++
++static void (*security_dump_masked_av_fn)(struct policydb *policydb, struct context *scontext,
++                                          struct context *tcontext, u16 tclass, u32 permissions, const char *reason) = NULL;
++static void (*context_struct_compute_av_fn)(struct policydb *policydb, struct context *scontext,
++                                            struct context *tcontext, u16 tclass, struct av_decision *avd,
++                                            struct extended_perms *xperms) = NULL;
++
++/*
++ * security/selinux/selinuxfs.c 的 write_op[] 是 static 数组，4.19 既不导出数组也
++ * 不导出下标枚举。这里先解析 sel_write_context / sel_write_access 的地址，再在
++ * write_op 的符号范围内按指针值定位槽位，顺带不依赖 inode 编号。
++ */
++static write_op_fn *find_write_op_slot(const char *fn_name)
++{
++    unsigned long table = find_kernel_symbol_exact("write_op");
++    unsigned long fn = find_kernel_symbol_exact(fn_name);
++    unsigned long size = 0;
++    size_t off;
++
++    if (!table || !fn)
++        return NULL;
++    if (!kallsyms_lookup_size_offset(table, &size, NULL) || size < sizeof(void *))
++        return NULL;
++
++    for (off = 0; off + sizeof(void *) <= size; off += sizeof(void *)) {
++        write_op_fn *slot = (write_op_fn *)(table + off);
++        if ((unsigned long)(*slot) == fn)
++            return slot;
++    }
++
++    return NULL;
++}
++
++/* 4.19 的 string_to_context_struct()，只解析单份策略 */
++static int hide_string_to_context(struct policydb *pol, struct sidtab *sidtabp, char *scontext,
++                                  struct context *ctx, u32 def_sid)
++{
++    struct role_datum *role;
++    struct type_datum *typdatum;
++    struct user_datum *usrdatum;
++    char *scontextp, *p, oldc;
++    int rc = 0;
++
++    context_init(ctx);
++
++    rc = -EINVAL;
++    scontextp = scontext;
++
++    /* 提取 user */
++    p = scontextp;
++    while (*p && *p != ':')
++        p++;
++    if (*p == 0)
++        goto out;
++    *p++ = 0;
++
++    usrdatum = hashtab_search(pol->p_users.table, scontextp);
++    if (!usrdatum)
++        goto out;
++    ctx->user = usrdatum->value;
++
++    /* 提取 role */
++    scontextp = p;
++    while (*p && *p != ':')
++        p++;
++    if (*p == 0)
++        goto out;
++    *p++ = 0;
++
++    role = hashtab_search(pol->p_roles.table, scontextp);
++    if (!role)
++        goto out;
++    ctx->role = role->value;
++
++    /* 提取 type */
++    scontextp = p;
++    while (*p && *p != ':')
++        p++;
++    oldc = *p;
++    *p++ = 0;
++
++    typdatum = hashtab_search(pol->p_types.table, scontextp);
++    if (!typdatum || typdatum->attribute)
++        goto out;
++    ctx->type = typdatum->value;
++
++    rc = mls_context_to_sid(pol, oldc, p, ctx, sidtabp, def_sid);
++    if (rc)
++        goto out;
++
++    /* 校验上下文是否合法 */
++    rc = -EINVAL;
++    if (!policydb_context_isvalid(pol, ctx))
++        goto out;
++    rc = 0;
++out:
++    if (rc)
++        context_destroy(ctx);
++    return rc;
++}
++
++/* 与 4.19 的 context_struct_to_string() 等价 */
++static int hide_context_struct_to_string(struct policydb *p, struct context *context, char **scontext,
++                                        u32 *scontext_len)
++{
++    char *scontextp;
++
++    if (scontext)
++        *scontext = NULL;
++    *scontext_len = 0;
++
++    if (context->len) {
++        *scontext_len = context->len;
++        if (scontext) {
++            *scontext = kstrdup(context->str, GFP_ATOMIC);
++            if (!(*scontext))
++                return -ENOMEM;
++        }
++        return 0;
++    }
++
++    /* 计算上下文的长度 */
++    *scontext_len += strlen(sym_name(p, SYM_USERS, context->user - 1)) + 1;
++    *scontext_len += strlen(sym_name(p, SYM_ROLES, context->role - 1)) + 1;
++    *scontext_len += strlen(sym_name(p, SYM_TYPES, context->type - 1)) + 1;
++    *scontext_len += mls_compute_context_len(p, context);
++
++    if (!scontext)
++        return 0;
++
++    scontextp = kmalloc(*scontext_len, GFP_ATOMIC);
++    if (!scontextp)
++        return -ENOMEM;
++    *scontext = scontextp;
++
++    scontextp += sprintf(scontextp, "%s:%s:%s", sym_name(p, SYM_USERS, context->user - 1),
++                         sym_name(p, SYM_ROLES, context->role - 1), sym_name(p, SYM_TYPES, context->type - 1));
++
++    mls_sid_to_context(p, context, &scontextp);
++
++    *scontextp = 0;
++
++    return 0;
++}
++
++/* 在快照策略里把上下文串解析成 sid */
++static int hide_backup_context_to_sid(const char *scontext, u32 scontext_len, u32 *sid)
++{
++    struct ksu_sepolicy_backup *backup = backup_sepolicy;
++    struct context ctx;
++    char *copy;
++    int rc;
++
++    *sid = SECSID_NULL;
++    if (!backup)
++        return -EAGAIN;
++    if (!scontext_len)
++        return -EINVAL;
++
++    copy = kmemdup_nul(scontext, scontext_len, GFP_KERNEL);
++    if (!copy)
++        return -ENOMEM;
++
++    rc = hide_string_to_context(&backup->policydb, backup->sidtab, copy, &ctx, SECSID_NULL);
++    if (!rc) {
++        rc = context_add_hash(&backup->policydb, &ctx);
++        if (!rc)
++            rc = sidtab_context_to_sid(backup->sidtab, &ctx, sid);
++        context_destroy(&ctx);
++    }
++
++    kfree(copy);
++    return rc;
++}
++
++/* 在线上策略里把上下文串解析成 sid，取的是真实可切入的 sid */
++static int hide_live_context_to_sid(const char *scontext, u32 scontext_len, u32 *sid)
++{
++    struct selinux_ss *ss = selinux_state.ss;
++    struct context ctx;
++    char *copy;
++    int rc;
++
++    *sid = SECSID_NULL;
++    if (!scontext_len)
++        return -EINVAL;
++
++    copy = kmemdup_nul(scontext, scontext_len, GFP_KERNEL);
++    if (!copy)
++        return -ENOMEM;
++
++    read_lock(&ss->policy_rwlock);
++    rc = hide_string_to_context(&ss->policydb, ss->sidtab, copy, &ctx, SECSID_NULL);
++    if (!rc) {
++        rc = context_add_hash(&ss->policydb, &ctx);
++        if (!rc)
++            rc = sidtab_context_to_sid(ss->sidtab, &ctx, sid);
++        context_destroy(&ctx);
++    }
++    read_unlock(&ss->policy_rwlock);
++
++    kfree(copy);
++    return rc;
++}
++
++/* 在快照策略里把 sid 还原成上下文串 */
++static int hide_backup_sid_to_context(u32 sid, char **scontext, u32 *scontext_len)
++{
++    struct ksu_sepolicy_backup *backup = backup_sepolicy;
++    struct context *ctx;
++
++    if (scontext)
++        *scontext = NULL;
++    *scontext_len = 0;
++    if (!backup)
++        return -EAGAIN;
++
++    ctx = sidtab_search(backup->sidtab, sid);
++    if (!ctx) {
++        pr_err("SELinux: %s:  unrecognized SID %d\n", __func__, sid);
++        return -EINVAL;
++    }
++
++    return hide_context_struct_to_string(&backup->policydb, ctx, scontext, scontext_len);
++}
++
++/* 4.19 的 constraint_expr_eval()，仅在没有解析到内核符号时使用 */
++static int hide_constraint_expr_eval(struct policydb *policydb, struct context *scontext,
++                                     struct context *tcontext, struct context *xcontext,
++                                     struct constraint_expr *cexpr)
++{
++    u32 val1, val2;
++    struct context *c;
++    struct role_datum *r1, *r2;
++    struct mls_level *l1, *l2;
++    struct constraint_expr *e;
++    int s[CEXPR_MAXDEPTH];
++    int sp = -1;
++
++    for (e = cexpr; e; e = e->next) {
++        switch (e->expr_type) {
++        case CEXPR_NOT:
++            BUG_ON(sp < 0);
++            s[sp] = !s[sp];
++            break;
++        case CEXPR_AND:
++            BUG_ON(sp < 1);
++            sp--;
++            s[sp] &= s[sp + 1];
++            break;
++        case CEXPR_OR:
++            BUG_ON(sp < 1);
++            sp--;
++            s[sp] |= s[sp + 1];
++            break;
++        case CEXPR_ATTR:
++            if (sp == (CEXPR_MAXDEPTH - 1))
++                return 0;
++            switch (e->attr) {
++            case CEXPR_USER:
++                val1 = scontext->user;
++                val2 = tcontext->user;
++                break;
++            case CEXPR_TYPE:
++                val1 = scontext->type;
++                val2 = tcontext->type;
++                break;
++            case CEXPR_ROLE:
++                val1 = scontext->role;
++                val2 = tcontext->role;
++                r1 = policydb->role_val_to_struct[val1 - 1];
++                r2 = policydb->role_val_to_struct[val2 - 1];
++                switch (e->op) {
++                case CEXPR_DOM:
++                    s[++sp] = ebitmap_get_bit(&r1->dominates, val2 - 1);
++                    continue;
++                case CEXPR_DOMBY:
++                    s[++sp] = ebitmap_get_bit(&r2->dominates, val1 - 1);
++                    continue;
++                case CEXPR_INCOMP:
++                    s[++sp] =
++                        (!ebitmap_get_bit(&r1->dominates, val2 - 1) && !ebitmap_get_bit(&r2->dominates, val1 - 1));
++                    continue;
++                default:
++                    break;
++                }
++                break;
++            case CEXPR_L1L2:
++                l1 = &(scontext->range.level[0]);
++                l2 = &(tcontext->range.level[0]);
++                goto mls_ops;
++            case CEXPR_L1H2:
++                l1 = &(scontext->range.level[0]);
++                l2 = &(tcontext->range.level[1]);
++                goto mls_ops;
++            case CEXPR_H1L2:
++                l1 = &(scontext->range.level[1]);
++                l2 = &(tcontext->range.level[0]);
++                goto mls_ops;
++            case CEXPR_H1H2:
++                l1 = &(scontext->range.level[1]);
++                l2 = &(tcontext->range.level[1]);
++                goto mls_ops;
++            case CEXPR_L1H1:
++                l1 = &(scontext->range.level[0]);
++                l2 = &(scontext->range.level[1]);
++                goto mls_ops;
++            case CEXPR_L2H2:
++                l1 = &(tcontext->range.level[0]);
++                l2 = &(tcontext->range.level[1]);
++                goto mls_ops;
++            mls_ops:
++                switch (e->op) {
++                case CEXPR_EQ:
++                    s[++sp] = mls_level_eq(l1, l2);
++                    continue;
++                case CEXPR_NEQ:
++                    s[++sp] = !mls_level_eq(l1, l2);
++                    continue;
++                case CEXPR_DOM:
++                    s[++sp] = mls_level_dom(l1, l2);
++                    continue;
++                case CEXPR_DOMBY:
++                    s[++sp] = mls_level_dom(l2, l1);
++                    continue;
++                case CEXPR_INCOMP:
++                    s[++sp] = mls_level_incomp(l2, l1);
++                    continue;
++                default:
++                    BUG();
++                    return 0;
++                }
++                break;
++            default:
++                BUG();
++                return 0;
++            }
++
++            switch (e->op) {
++            case CEXPR_EQ:
++                s[++sp] = (val1 == val2);
++                break;
++            case CEXPR_NEQ:
++                s[++sp] = (val1 != val2);
++                break;
++            default:
++                BUG();
++                return 0;
++            }
++            break;
++        case CEXPR_NAMES:
++            if (sp == (CEXPR_MAXDEPTH - 1))
++                return 0;
++            c = scontext;
++            if (e->attr & CEXPR_TARGET)
++                c = tcontext;
++            else if (e->attr & CEXPR_XTARGET) {
++                c = xcontext;
++                if (!c) {
++                    BUG();
++                    return 0;
++                }
++            }
++            if (e->attr & CEXPR_USER)
++                val1 = c->user;
++            else if (e->attr & CEXPR_ROLE)
++                val1 = c->role;
++            else if (e->attr & CEXPR_TYPE)
++                val1 = c->type;
++            else {
++                BUG();
++                return 0;
++            }
++
++            switch (e->op) {
++            case CEXPR_EQ:
++                s[++sp] = ebitmap_get_bit(&e->names, val1 - 1);
++                break;
++            case CEXPR_NEQ:
++                s[++sp] = !ebitmap_get_bit(&e->names, val1 - 1);
++                break;
++            default:
++                BUG();
++                return 0;
++            }
++            break;
++        default:
++            BUG();
++            return 0;
++        }
++    }
++
++    BUG_ON(sp != 0);
++    return s[0];
++}
++
++static void hide_context_struct_compute_av(struct policydb *policydb, struct context *scontext,
++                                           struct context *tcontext, u16 tclass, struct av_decision *avd,
++                                           struct extended_perms *xperms);
++
++/* 4.19 的 type_attribute_bounds_av() */
++static void hide_type_attribute_bounds_av(struct policydb *policydb, struct context *scontext,
++                                          struct context *tcontext, u16 tclass, struct av_decision *avd)
++{
++    struct context lo_scontext;
++    struct context lo_tcontext, *tcontextp = tcontext;
++    struct av_decision lo_avd;
++    struct type_datum *source;
++    struct type_datum *target;
++    u32 masked = 0;
++
++    source = flex_array_get_ptr(policydb->type_val_to_struct_array, scontext->type - 1);
++    BUG_ON(!source);
++
++    if (!source->bounds)
++        return;
++
++    target = flex_array_get_ptr(policydb->type_val_to_struct_array, tcontext->type - 1);
++    BUG_ON(!target);
++
++    memset(&lo_avd, 0, sizeof(lo_avd));
++
++    memcpy(&lo_scontext, scontext, sizeof(lo_scontext));
++    lo_scontext.type = source->bounds;
++
++    if (target->bounds) {
++        memcpy(&lo_tcontext, tcontext, sizeof(lo_tcontext));
++        lo_tcontext.type = target->bounds;
++        tcontextp = &lo_tcontext;
++    }
++
++    hide_context_struct_compute_av(policydb, &lo_scontext, tcontextp, tclass, &lo_avd, NULL);
++
++    masked = ~lo_avd.allowed & avd->allowed;
++
++    if (likely(!masked))
++        return;
++
++    /* 屏蔽越界的权限 */
++    avd->allowed &= ~masked;
++
++    if (security_dump_masked_av_fn)
++        security_dump_masked_av_fn(policydb, scontext, tcontext, tclass, masked, "bounds");
++}
++
++/* 4.19 的 context_struct_compute_av() */
++static void hide_context_struct_compute_av(struct policydb *policydb, struct context *scontext,
++                                           struct context *tcontext, u16 tclass, struct av_decision *avd,
++                                           struct extended_perms *xperms)
++{
++    struct constraint_node *constraint;
++    struct role_allow *ra;
++    struct avtab_key avkey;
++    struct avtab_node *node;
++    struct class_datum *tclass_datum;
++    struct ebitmap *sattr, *tattr;
++    struct ebitmap_node *snode, *tnode;
++    unsigned int i, j;
++
++    avd->allowed = 0;
++    avd->auditallow = 0;
++    avd->auditdeny = 0xffffffff;
++    if (xperms) {
++        memset(&xperms->drivers, 0, sizeof(xperms->drivers));
++        xperms->len = 0;
++    }
++
++    if (unlikely(!tclass || tclass > policydb->p_classes.nprim)) {
++        pr_warn_ratelimited("SELinux:  Invalid class %u\n", tclass);
++        return;
++    }
++
++    tclass_datum = policydb->class_val_to_struct[tclass - 1];
++
++    avkey.target_class = tclass;
++    avkey.specified = AVTAB_AV | AVTAB_XPERMS;
++    sattr = flex_array_get(policydb->type_attr_map_array, scontext->type - 1);
++    BUG_ON(!sattr);
++    tattr = flex_array_get(policydb->type_attr_map_array, tcontext->type - 1);
++    BUG_ON(!tattr);
++    ebitmap_for_each_positive_bit(sattr, snode, i)
++    {
++        ebitmap_for_each_positive_bit(tattr, tnode, j)
++        {
++            avkey.source_type = i + 1;
++            avkey.target_type = j + 1;
++            for (node = avtab_search_node(&policydb->te_avtab, &avkey); node;
++                 node = avtab_search_node_next(node, avkey.specified)) {
++                if (node->key.specified == AVTAB_ALLOWED)
++                    avd->allowed |= node->datum.u.data;
++                else if (node->key.specified == AVTAB_AUDITALLOW)
++                    avd->auditallow |= node->datum.u.data;
++                else if (node->key.specified == AVTAB_AUDITDENY)
++                    avd->auditdeny &= node->datum.u.data;
++                else if (xperms && (node->key.specified & AVTAB_XPERMS))
++                    services_compute_xperms_drivers(xperms, node);
++            }
++
++            cond_compute_av(&policydb->te_cond_avtab, &avkey, avd, xperms);
++        }
++    }
++
++    constraint = tclass_datum->constraints;
++    while (constraint) {
++        if ((constraint->permissions & (avd->allowed)) &&
++            !hide_constraint_expr_eval(policydb, scontext, tcontext, NULL, constraint->expr)) {
++            avd->allowed &= ~(constraint->permissions);
++        }
++        constraint = constraint->next;
++    }
++
++    if (tclass == policydb->process_class && (avd->allowed & policydb->process_trans_perms) &&
++        scontext->role != tcontext->role) {
++        for (ra = policydb->role_allow; ra; ra = ra->next) {
++            if (scontext->role == ra->role && tcontext->role == ra->new_role)
++                break;
++        }
++        if (!ra)
++            avd->allowed &= ~policydb->process_trans_perms;
++    }
++
++    hide_type_attribute_bounds_av(policydb, scontext, tcontext, tclass, avd);
++}
++
++static void hide_avd_init(struct av_decision *avd)
++{
++    avd->allowed = 0;
++    avd->auditallow = 0;
++    avd->auditdeny = 0xffffffff;
++    avd->seqno = backup_sepolicy ? backup_sepolicy->latest_granting : 0;
++    avd->flags = 0;
++}
++
++/* 在快照策略上重算访问判定；与 4.19 的 security_compute_av_user() 对齐 */
++static void hide_security_compute_av_user(u32 ssid, u32 tsid, u16 tclass, struct av_decision *avd)
++{
++    struct ksu_sepolicy_backup *backup = backup_sepolicy;
++    struct policydb *policydb;
++    struct sidtab *sidtab;
++    struct context *scontext, *tcontext;
++
++    hide_avd_init(avd);
++    if (!backup)
++        goto allow;
++
++    policydb = &backup->policydb;
++    sidtab = backup->sidtab;
++
++    scontext = sidtab_search(sidtab, ssid);
++    if (!scontext) {
++        pr_err("SELinux: %s:  unrecognized SID %d\n", __func__, ssid);
++        return;
++    }
++
++    /* 宽容模式域 */
++    if (ebitmap_get_bit(&policydb->permissive_map, scontext->type))
++        avd->flags |= AVD_FLAGS_PERMISSIVE;
++
++    tcontext = sidtab_search(sidtab, tsid);
++    if (!tcontext) {
++        pr_err("SELinux: %s:  unrecognized SID %d\n", __func__, tsid);
++        return;
++    }
++
++    if (unlikely(!tclass)) {
++        if (policydb->allow_unknown)
++            goto allow;
++        return;
++    }
++
++    if (context_struct_compute_av_fn)
++        context_struct_compute_av_fn(policydb, scontext, tcontext, tclass, avd, NULL);
++    else
++        hide_context_struct_compute_av(policydb, scontext, tcontext, tclass, avd, NULL);
++    return;
++allow:
++    avd->allowed = 0xffffffff;
++}
++
++static ssize_t my_write_context(struct file *file, char *buf, size_t size)
++{
++    char *canon = NULL;
++    u32 sid, len;
++    ssize_t length;
++
++    /* 系统进程（uid < 10000）照旧走原生实现 */
++    if (likely(current_uid().val < 10000))
++        return orig_context_write(file, buf, size);
++
++    length = avc_has_perm(&selinux_state, current_sid(), SECINITSID_SECURITY, SECCLASS_SECURITY,
++                          SECURITY__CHECK_CONTEXT, NULL);
++    if (length)
++        goto out;
++
++    length = hide_backup_context_to_sid(buf, size, &sid);
++    if (length)
++        goto out;
++
++    length = hide_backup_sid_to_context(sid, &canon, &len);
++    if (length)
++        goto out;
++
++    length = -ERANGE;
++    if (len > SIMPLE_TRANSACTION_LIMIT) {
++        pr_err("SELinux: %s:  context size (%u) exceeds payload max\n", __func__, len);
++        goto out;
++    }
++
++    memcpy(buf, canon, len);
++    length = len;
++out:
++    kfree(canon);
++    return length;
++}
++
++static ssize_t my_write_access(struct file *file, char *buf, size_t size)
++{
++    char *scon = NULL, *tcon = NULL;
++    u32 ssid, tsid, sconlen, tconlen;
++    u16 tclass;
++    struct av_decision avd;
++    ssize_t length;
++
++    if (likely(current_uid().val < 10000))
++        return orig_access_write(file, buf, size);
++
++    length =
++        avc_has_perm(&selinux_state, current_sid(), SECINITSID_SECURITY, SECCLASS_SECURITY, SECURITY__COMPUTE_AV, NULL);
++    if (length)
++        goto out;
++
++    length = -ENOMEM;
++    scon = kzalloc(size + 1, GFP_KERNEL);
++    if (!scon)
++        goto out;
++
++    tcon = kzalloc(size + 1, GFP_KERNEL);
++    if (!tcon)
++        goto out;
++
++    length = -EINVAL;
++    if (sscanf(buf, "%s %s %hu", scon, tcon, &tclass) != 3)
++        goto out;
++
++    sconlen = strlen(scon);
++    tconlen = strlen(tcon);
++
++    length = hide_backup_context_to_sid(scon, sconlen, &ssid);
++    if (length)
++        goto out;
++
++    length = hide_backup_context_to_sid(tcon, tconlen, &tsid);
++    if (length)
++        goto out;
++
++    hide_security_compute_av_user(ssid, tsid, tclass, &avd);
++
++    length = scnprintf(buf, SIMPLE_TRANSACTION_LIMIT, "%x %x %x %x %u %x", avd.allowed, 0xffffffff, avd.auditallow,
++                       avd.auditdeny, avd.seqno, avd.flags);
++out:
++    kfree(tcon);
++    kfree(scon);
++    return length;
++}
++
++/*
++ * 取 cred 的 SID
++ */
++static inline u32 hide_cred_sid(const struct cred *cred)
++{
++    return selinux_cred(cred)->sid;
++}
++
++static u32 hide_task_sid_obj(const struct task_struct *task)
++{
++    u32 sid;
++
++    rcu_read_lock();
++    sid = hide_cred_sid(__task_cred(task));
++    rcu_read_unlock();
++    return sid;
++}
++
++static u32 hide_ptrace_parent_sid(void)
++{
++    u32 sid = 0;
++    struct task_struct *tracer;
++
++    rcu_read_lock();
++    tracer = ptrace_parent(current);
++    if (tracer)
++        sid = hide_task_sid_obj(tracer);
++    rcu_read_unlock();
++
++    return sid;
++}
++
++typedef int (*setprocattr_fn)(const char *name, void *value, size_t size);
++static int __nocfi my_setprocattr(const char *name, void *value, size_t size);
++static struct ksu_lsm_hook selinux_setprocattr_hook = KSU_LSM_HOOK_INIT(setprocattr, "selinux_setprocattr", my_setprocattr, 0);
++
++static int __nocfi my_setprocattr(const char *name, void *value, size_t size)
++{
++    struct task_security_struct *tsec;
++    struct cred *new;
++    u32 mysid, sid = SECSID_NULL, backup_sid, ptsid;
++    int error, backup_error;
++    char *str = value;
++
++    if (likely(current_uid().val < 10000))
++        goto call_orig;
++
++    if (strcmp(name, "current"))
++        goto call_orig;
++
++    mysid = current_sid();
++    error = avc_has_perm(&selinux_state, mysid, mysid, SECCLASS_PROCESS, PROCESS__SETCURRENT, NULL);
++    if (error)
++        return error;
++
++    /* 拿到上下文对应的 SID */
++    if (size && str[0] && str[0] != '\n') {
++        if (str[size - 1] == '\n') {
++            str[size - 1] = 0;
++            size--;
++        }
++        /* 快照拒绝的上下文（例如 ksu 域）即便线上策略认可，也按拒绝处理 */
++        backup_error = hide_backup_context_to_sid(value, size, &backup_sid);
++        error = hide_live_context_to_sid(value, size, &sid);
++        if (backup_error || error)
++            return backup_error ?: error;
++    }
++
++    new = prepare_creds();
++    if (!new)
++        return -ENOMEM;
++
++    /* 权限检查基于指定的上下文，在实际操作（execve、open 等）时进行 */
++    tsec = selinux_cred(new);
++    error = -EINVAL;
++    if (sid == SECSID_NULL)
++        goto abort_change;
++
++    if (!current_is_single_threaded()) {
++        error = security_bounded_transition(&selinux_state, tsec->sid, sid);
++        if (error)
++            goto abort_change;
++    }
++
++    /* 检查域转换权限 */
++    error = avc_has_perm(&selinux_state, tsec->sid, sid, SECCLASS_PROCESS, PROCESS__DYNTRANSITION, NULL);
++    if (error)
++        goto abort_change;
++
++    /* 检查是否被 ptrace，允许时更新任务 SID，否则保持原状并报错 */
++    ptsid = hide_ptrace_parent_sid();
++    if (ptsid != 0) {
++        error = avc_has_perm(&selinux_state, ptsid, sid, SECCLASS_PROCESS, PROCESS__PTRACE, NULL);
++        if (error)
++            goto abort_change;
++    }
++
++    tsec->sid = sid;
++
++    commit_creds(new);
++    return size;
++
++abort_change:
++    abort_creds(new);
++    return error;
++
++call_orig:
++    return ((setprocattr_fn)selinux_setprocattr_hook.original)(name, value, size);
++}
++
++static void hide_initialize_fake_status(void)
++{
++    struct selinux_ss *ss = selinux_state.ss;
++    struct selinux_kernel_status *status;
++    struct selinux_kernel_status *new_status;
++    struct page *new_page;
++
++    mutex_lock(&ss->status_lock);
++    if (fake_status)
++        goto out;
++    if (!ss->status_page) {
++        pr_warn("selinux_hide: status_page not exist\n");
++        goto out;
++    }
++
++    status = page_address(ss->status_page);
++    if (!status->enforcing && !ksu_late_loaded) {
++        pr_warn("selinux_hide: skip not enforcing\n");
++        goto out;
++    }
++
++    new_page = alloc_page(GFP_KERNEL | __GFP_ZERO);
++    if (!new_page) {
++        pr_err("selinux_hide: failed to allocate page\n");
++        goto out;
++    }
++
++    new_status = page_address(new_page);
++    memcpy(new_status, status, sizeof(*status));
++    if (ksu_late_loaded) {
++        /* 迟到加载时线上状态页可能已被 reload/setenforce 改过，给出原厂启动后的样子 */
++        new_status->sequence = 0;
++        new_status->policyload = 0;
++        if (!new_status->enforcing)
++            new_status->enforcing = 1;
++    }
++
++    fake_status = new_page;
++    pr_info("selinux_hide: fake status initialized: sequence=%u, policyload=%u, enforcing=%u\n",
++            new_status->sequence, new_status->policyload, new_status->enforcing);
++
++out:
++    mutex_unlock(&ss->status_lock);
++}
++
++typedef int (*sel_open_handle_status_fn)(struct inode *inode, struct file *filp);
++static sel_open_handle_status_fn orig_sel_open_handle_status;
++static sel_open_handle_status_fn *sel_open_handle_status_slot;
++
++static int my_sel_open_handle_status(struct inode *inode, struct file *filp)
++{
++    struct selinux_ss *ss = selinux_state.ss;
++    int ret;
++
++    if (likely(current_uid().val >= 10000 && ksu_selinux_hide_enabled)) {
++        void *data;
++
++        mutex_lock(&ss->status_lock);
++        data = fake_status;
++        mutex_unlock(&ss->status_lock);
++        if (data) {
++            filp->private_data = data;
++            return 0;
++        }
++    }
++
++    ret = orig_sel_open_handle_status(inode, filp);
++    if (static_branch_unlikely(&fake_status_initialize_key) && !ret && !fake_status)
++        hide_initialize_fake_status();
++    return ret;
++}
++
++static void hook_selinux_status_open(void)
++{
++    struct file_operations *ops;
++    sel_open_handle_status_fn new_fn;
++    int ret;
++
++    if (orig_sel_open_handle_status)
++        return;
++    if (!sel_open_handle_status_slot) {
++        ops = (struct file_operations *)find_kernel_symbol_exact("sel_handle_status_ops");
++        if (!ops) {
++            pr_err("selinux_hide: sel_handle_status_ops not found, fake status will not work\n");
++            return;
++        }
++        sel_open_handle_status_slot = &ops->open;
++    }
++
++    new_fn = my_sel_open_handle_status;
++    orig_sel_open_handle_status = *sel_open_handle_status_slot;
++    ret = ksu_patch_text(sel_open_handle_status_slot, &new_fn, sizeof(new_fn), KSU_PATCH_TEXT_FLUSH_DCACHE);
++    if (ret) {
++        pr_err("selinux_hide: patch_text sel_open_handle_status err: %d\n", ret);
++        sel_open_handle_status_slot = NULL;
++        orig_sel_open_handle_status = NULL;
++    }
++}
++
++static void ksu_selinux_hide_unhook(void)
++{
++    int ret;
++
++    if (context_write && orig_context_write) {
++        ret = ksu_patch_text(context_write, &orig_context_write, sizeof(orig_context_write),
++                             KSU_PATCH_TEXT_FLUSH_DCACHE);
++        orig_context_write = NULL;
++        if (ret)
++            pr_err("selinux_hide: exit: patch_text context_write err: %d\n", ret);
++    }
++    if (access_write && orig_access_write) {
++        ret =
++            ksu_patch_text(access_write, &orig_access_write, sizeof(orig_access_write), KSU_PATCH_TEXT_FLUSH_DCACHE);
++        orig_access_write = NULL;
++        if (ret)
++            pr_err("selinux_hide: exit: patch_text access_write err: %d\n", ret);
++    }
++    if (sel_open_handle_status_slot && orig_sel_open_handle_status) {
++        ret = ksu_patch_text(sel_open_handle_status_slot, &orig_sel_open_handle_status,
++                             sizeof(orig_sel_open_handle_status), KSU_PATCH_TEXT_FLUSH_DCACHE);
++        orig_sel_open_handle_status = NULL;
++        if (ret)
++            pr_err("selinux_hide: exit: patch_text sel_open_handle_status err: %d\n", ret);
++    }
++
++    ksu_lsm_unhook(&selinux_setprocattr_hook);
++}
++
++static int ksu_selinux_hide_enable(void)
++{
++    write_op_fn my;
++    int ret;
++
++    pr_info("selinux_hide: init selinux hide\n");
++    if (!backup_sepolicy) {
++        pr_err("no backup sepolicy available, please save feature and reboot to retry!\n");
++        return -EAGAIN;
++    }
++
++    hook_selinux_status_open();
++
++    security_dump_masked_av_fn = (void *)find_kernel_symbol_exact("security_dump_masked_av");
++    if (!security_dump_masked_av_fn)
++        pr_warn("selinux_hide: security_dump_masked_av not found\n");
++    context_struct_compute_av_fn = (void *)find_kernel_symbol_exact("context_struct_compute_av");
++    if (!context_struct_compute_av_fn)
++        pr_warn("selinux_hide: context_struct_compute_av not found, using local copy\n");
++
++    context_write = find_write_op_slot("sel_write_context");
++    if (!context_write) {
++        pr_err("selinux_hide: sel_write_context slot not found\n");
++        goto unhook;
++    }
++    orig_context_write = *context_write;
++    my = my_write_context;
++    pr_info("selinux_hide: context_write: 0x%lx [%pS]\n", (unsigned long)*context_write, *context_write);
++    ret = ksu_patch_text(context_write, &my, sizeof(my), KSU_PATCH_TEXT_FLUSH_DCACHE);
++    if (ret) {
++        pr_err("selinux_hide: patch_text context_write err: %d\n", ret);
++        goto unhook;
++    }
++
++    access_write = find_write_op_slot("sel_write_access");
++    if (!access_write) {
++        pr_err("selinux_hide: sel_write_access slot not found\n");
++        goto unhook;
++    }
++    orig_access_write = *access_write;
++    my = my_write_access;
++    pr_info("selinux_hide: access_write: 0x%lx [%pS]\n", (unsigned long)*access_write, *access_write);
++    ret = ksu_patch_text(access_write, &my, sizeof(my), KSU_PATCH_TEXT_FLUSH_DCACHE);
++    if (ret) {
++        pr_err("selinux_hide: patch_text access_write err: %d\n", ret);
++        goto unhook;
++    }
++
++    ret = ksu_lsm_hook(&selinux_setprocattr_hook);
++    if (ret) {
++        pr_err("selinux_hide: ksu_lsm_hook selinux_setprocattr err: %d\n", ret);
++        goto unhook;
++    }
++
++    return 0;
++
++unhook:
++    ksu_selinux_hide_unhook();
++    return -ENOSYS;
++}
++
++static void ksu_selinux_hide_disable(void)
++{
++    pr_info("selinux_hide: exit selinux hide\n");
++    ksu_selinux_hide_unhook();
++}
++
++static int selinux_hide_feature_get(u64 *value)
++{
++    *value = ksu_selinux_hide_enabled ? 1 : 0;
++    return 0;
++}
++
++static int selinux_hide_feature_set(u64 value)
++{
++    bool enable = value != 0;
++    int ret = 0;
++
++    pr_info("selinux_hide: set to %d\n", enable);
++    mutex_lock(&selinux_hide_mutex);
++    ksu_selinux_hide_enabled = enable;
++    if (enable) {
++        if (!ksu_selinux_hide_running) {
++            ret = ksu_selinux_hide_enable();
++            if (!ret)
++                ksu_selinux_hide_running = true;
++        }
++    } else {
++        if (ksu_selinux_hide_running) {
++            ksu_selinux_hide_disable();
++            ksu_selinux_hide_running = false;
++        }
++    }
++    mutex_unlock(&selinux_hide_mutex);
++    return ret;
++}
++
++static const struct ksu_feature_handler selinux_hide_handler = {
++    .feature_id = KSU_FEATURE_SELINUX_HIDE,
++    .name = "selinux_hide",
++    .get_handler = selinux_hide_feature_get,
++    .set_handler = selinux_hide_feature_set,
++};
++
++void ksu_selinux_hide_handle_second_stage()
++{
++    hide_initialize_fake_status();
++    if (fake_status) {
++        static_key_disable(&fake_status_initialize_key.key);
++    } else {
++        pr_warn("selinux_hide: fake status need late initialization\n");
++    }
++}
++
++void ksu_selinux_hide_handle_post_fs_data()
++{
++    static_key_disable(&fake_status_initialize_key.key);
++    if (!fake_status)
++        pr_err("selinux_hide: fake status is not initialized after post-fs-data!\n");
++}
++
++void __init ksu_selinux_hide_init()
++{
++    if (ksu_register_feature_handler(&selinux_hide_handler))
++        pr_err("Failed to register selinux_hide feature handler\n");
++    if (ksu_late_loaded)
++        hide_initialize_fake_status();
++    else
++        static_key_enable(&fake_status_initialize_key.key);
++    hook_selinux_status_open();
++}
++
++void __exit ksu_selinux_hide_exit()
++{
++    struct selinux_ss *ss = selinux_state.ss;
++
++    mutex_lock(&selinux_hide_mutex);
++    if (ksu_selinux_hide_running) {
++        ksu_selinux_hide_disable();
++        ksu_selinux_hide_running = false;
++    }
++    mutex_unlock(&selinux_hide_mutex);
++    ksu_unregister_feature_handler(KSU_FEATURE_SELINUX_HIDE);
++    mutex_lock(&ss->status_lock);
++    if (fake_status)
++        __free_page(fake_status);
++    fake_status = NULL;
++    mutex_unlock(&ss->status_lock);
++}
++
++void ksu_selinux_hide_drop_backup_if_unused()
++{
++    mutex_lock(&selinux_hide_mutex);
++    if (!ksu_selinux_hide_running && backup_sepolicy) {
++        pr_info("selinux_hide is not enabled - drop backup_sepolicy\n");
++        ksu_destroy_sepolicy_backup(backup_sepolicy);
++        backup_sepolicy = NULL;
++    }
++    mutex_unlock(&selinux_hide_mutex);
++}
++#endif
+diff --git a/kernel/feature/sucompat.c b/kernel/feature/sucompat.c
+index f5cd7bf2..43a5cc89 100644
+--- a/kernel/feature/sucompat.c
++++ b/kernel/feature/sucompat.c
+@@ -5,7 +5,12 @@
+ #include <linux/preempt.h>
+ #include <linux/printk.h>
+ #include <linux/mm.h>
++#include <linux/version.h>
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
+ #include <linux/pgtable.h>
++#else
++#include <asm/pgtable.h>
++#endif
+ #include <linux/uaccess.h>
+ #include <asm/current.h>
+ #include <linux/cred.h>
+diff --git a/kernel/hook/arm64/patch_memory.c b/kernel/hook/arm64/patch_memory.c
+index c344bd55..bd10bbdd 100644
+--- a/kernel/hook/arm64/patch_memory.c
++++ b/kernel/hook/arm64/patch_memory.c
+@@ -20,6 +20,19 @@
+ // init_mm page tables. Returns the physical address on success, or writes
+ // a non-zero error to *err. Callers must check *err before using the result,
+ // since physical address 0 is a valid address.
++/*
++ * 4.19 的 arm64 还没有 pmd_leaf()/pud_leaf()，只有 pmd_sect()/pud_sect()，
++ * 并且 pmd_bad()/pud_bad() 会把块映射（section）判为坏项。内核镜像在
++ * init_mm 中按 2 MiB 段映射，只按 pte 查找会在这里直接失败，因此先判块映射
++ * 再判 bad。
++ */
++#if !defined(pmd_leaf) && defined(pmd_sect)
++#define pmd_leaf(pmd) pmd_sect(pmd)
++#endif
++#if !defined(pud_leaf) && defined(pud_sect)
++#define pud_leaf(pud) pud_sect(pud)
++#endif
++
+ unsigned long phys_from_virt(unsigned long addr, int *err)
+ {
+     struct mm_struct *mm = &init_mm;
+@@ -37,8 +50,6 @@ unsigned long phys_from_virt(unsigned long addr, int *err)
+     pr_debug("pgd of 0x%lx p=0x%lx v=0x%lx", addr, (uintptr_t)pgd, (uintptr_t)pgd_val(*pgd));
+ 
+     p4d = p4d_offset(pgd, addr);
+-    if (p4d_none(*p4d) || p4d_bad(*p4d))
+-        goto fail;
+     pr_debug("p4d of 0x%lx p=0x%lx v=0x%lx", addr, (uintptr_t)p4d, (uintptr_t)p4d_val(*p4d));
+ #if defined(p4d_leaf)
+     if (p4d_leaf(*p4d)) {
+@@ -46,10 +57,10 @@ unsigned long phys_from_virt(unsigned long addr, int *err)
+         return __p4d_to_phys(*p4d) + ((addr & ~P4D_MASK));
+     }
+ #endif
++    if (p4d_none(*p4d) || p4d_bad(*p4d))
++        goto fail;
+ 
+     pud = pud_offset(p4d, addr);
+-    if (pud_none(*pud) || pud_bad(*pud))
+-        goto fail;
+     pr_debug("pud of 0x%lx p=0x%lx v=0x%lx", addr, (uintptr_t)pud, (uintptr_t)pud_val(*pud));
+ #if defined(pud_leaf)
+     if (pud_leaf(*pud)) {
+@@ -57,6 +68,8 @@ unsigned long phys_from_virt(unsigned long addr, int *err)
+         return __pud_to_phys(*pud) + ((addr & ~PUD_MASK));
+     }
+ #endif
++    if (pud_none(*pud) || pud_bad(*pud))
++        goto fail;
+ 
+     pmd = pmd_offset(pud, addr);
+     pr_debug("pmd of 0x%lx p=0x%lx v=0x%lx", addr, (uintptr_t)pmd, (uintptr_t)pmd_val(*pmd));
+diff --git a/kernel/hook/arm64/syscall_hook.c b/kernel/hook/arm64/syscall_hook.c
+index f8d052c3..f999c79e 100644
+--- a/kernel/hook/arm64/syscall_hook.c
++++ b/kernel/hook/arm64/syscall_hook.c
+@@ -215,8 +215,18 @@ void __init ksu_syscall_hook_init(void)
+         return;
+     }
+ 
++    /*
++     * 表项写入失败时槽位仍是 sys_ni_syscall。此时若继续让 sys_enter 把已注册的
++     * 号重定向到该槽位，所有被挂钩的调用都会返回 -ENOSYS：4.19 上的表现是
++     * init 第一阶段 execve/ueventd 失败、/dev/block/by-name 缺失，最后内核
++     * panic(Attempted to kill init)。写不进去就放弃重定向与全部 syscall 钩子。
++     */
++    if (patch_syscall_table(ni_slot, (syscall_fn_t)ksu_syscall_dispatcher)) {
++        pr_err("syscall hooks disabled: dispatcher slot %d not patched\n", ni_slot);
++        return;
++    }
++
+     ksu_dispatcher_nr = ni_slot;
+-    ksu_syscall_table_hook(ksu_dispatcher_nr, (syscall_fn_t)ksu_syscall_dispatcher, NULL);
+     pr_info("dispatcher installed at slot %d\n", ksu_dispatcher_nr);
+ }
+ 
+diff --git a/kernel/include/klog.h b/kernel/include/klog.h
+index a934027f..42955bc1 100644
+--- a/kernel/include/klog.h
++++ b/kernel/include/klog.h
+@@ -2,6 +2,81 @@
+ #define __KSU_H_KLOG
+ 
+ #include <linux/printk.h>
++#include <linux/types.h>
++#include <linux/version.h>
++
++/* 4.19 的 task_work_add() 第三参数为 bool notify，5.7 起改为 TWA_* 枚举。 */
++#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 7, 0)
++#define TWA_RESUME true
++#endif
++
++/* 4.19 兼容：以下符号在 5.x 才进入主线，集中放在公共头里供各编译单元使用。 */
++#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
++#include <linux/uaccess.h>
++#include <linux/sched/task.h>
++
++static inline long copy_from_user_nofault(void *dst, const void __user *src, size_t size)
++{
++	return probe_kernel_read(dst, (const void *)src, size);
++}
++
++static inline long copy_to_user_nofault(void __user *dst, const void *src, size_t size)
++{
++	return probe_kernel_write((void *)dst, src, size);
++}
++
++static inline long copy_to_kernel_nofault(void *dst, const void *src, size_t size)
++{
++	return probe_kernel_write(dst, src, size);
++}
++
++/* 参照 v0.9.2 的 kernel_compat.c，4.19 用 set_fs + strncpy_from_user。 */
++static inline long strncpy_from_user_nofault(char *dst, const void __user *unsafe_addr, long count)
++{
++	mm_segment_t old_fs = get_fs();
++	long ret;
++
++	if (unlikely(count <= 0))
++		return 0;
++
++	set_fs(USER_DS);
++	pagefault_disable();
++	ret = strncpy_from_user(dst, unsafe_addr, count);
++	pagefault_enable();
++	set_fs(old_fs);
++
++	if (ret >= count) {
++		ret = count;
++		dst[ret - 1] = '\0';
++	} else if (ret > 0) {
++		ret++;
++	}
++
++	return ret;
++}
++
++static inline ssize_t strscpy_pad(char *dst, const char *src, size_t count)
++{
++	ssize_t len = strscpy(dst, src, count);
++
++	if (len < 0)
++		return len;
++	if ((size_t)len < count)
++		memset(dst + len, 0, count - (size_t)len);
++	return len;
++}
++
++/* 4.19 的 SELinux 安全结构体直接由 cred->security 与 inode->i_security 取得。 */
++#define selinux_cred(cred) ((struct task_security_struct *)((cred)->security))
++#define selinux_inode(inode) ((struct inode_security_struct *)((inode)->i_security))
++
++/* 4.19 无 anon inode 的 SELinux 初始化钩子，跳过即可。 */
++static inline int security_inode_init_security_anon(struct inode *inode, const struct qstr *name,
++						     const struct inode *context_inode)
++{
++	return 0;
++}
++#endif
+ 
+ #ifdef pr_fmt
+ #undef pr_fmt
+diff --git a/kernel/include/ksu.h b/kernel/include/ksu.h
+index be25a826..af4e5885 100644
+--- a/kernel/include/ksu.h
++++ b/kernel/include/ksu.h
+@@ -4,6 +4,7 @@
+ #include <linux/types.h>
+ #include <linux/cred.h>
+ #include <linux/workqueue.h>
++#include <linux/version.h>
+ 
+ #define KERNEL_SU_VERSION KSU_VERSION
+ 
+@@ -13,7 +14,11 @@ extern bool allow_shell;
+ #ifdef MODULE
+ extern bool ksu_bundled;
+ #endif
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
+ extern struct selinux_policy *backup_sepolicy;
++#else
++extern struct ksu_sepolicy_backup *backup_sepolicy;
++#endif
+ extern bool ksu_no_custom_rc;
+ 
+ static inline int startswith(char *s, char *prefix)
+diff --git a/kernel/infra/file_wrapper.c b/kernel/infra/file_wrapper.c
+index 7372df02..36f47b02 100644
+--- a/kernel/infra/file_wrapper.c
++++ b/kernel/infra/file_wrapper.c
+@@ -93,7 +93,7 @@ static int ksu_wrapper_iopoll(struct kiocb *kiocb, struct io_comp_batch *icb, un
+     kiocb->ki_filp = orig;
+     return orig->f_op->iopoll(kiocb, icb, v);
+ }
+-#else
++#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0)
+ static int ksu_wrapper_iopoll(struct kiocb *kiocb, bool spin)
+ {
+     struct ksu_file_wrapper *data = kiocb->ki_filp->private_data;
+@@ -308,6 +308,7 @@ static ssize_t ksu_wrapper_copy_file_range(struct file *file_in, loff_t pos_in,
+ // https://cs.android.com/android/kernel/superproject/+/common-android-mainline:common/fs/remap_range.c;l=403-404;drc=398da7defe218d3e51b0f3bdff75147e28125b60
+ // REMAP_FILE_DEDUP: use file_out
+ // https://cs.android.com/android/kernel/superproject/+/common-android-mainline:common/fs/remap_range.c;l=483-484;drc=398da7defe218d3e51b0f3bdff75147e28125b60
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0)
+ static loff_t ksu_wrapper_remap_file_range(struct file *file_in, loff_t pos_in, struct file *file_out, loff_t pos_out,
+                                            loff_t len, unsigned int remap_flags)
+ {
+@@ -321,6 +322,7 @@ static loff_t ksu_wrapper_remap_file_range(struct file *file_in, loff_t pos_in,
+         return orig->f_op->remap_file_range(orig, pos_in, file_out, pos_out, len, remap_flags);
+     }
+ }
++#endif
+ 
+ static int ksu_wrapper_fadvise(struct file *fp, loff_t off1, loff_t off2, int flags)
+ {
+@@ -361,7 +363,9 @@ static struct ksu_file_wrapper *ksu_create_file_wrapper(struct file *fp)
+     p->ops.write = fp->f_op->write ? ksu_wrapper_write : NULL;
+     p->ops.read_iter = fp->f_op->read_iter ? ksu_wrapper_read_iter : NULL;
+     p->ops.write_iter = fp->f_op->write_iter ? ksu_wrapper_write_iter : NULL;
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0)
+     p->ops.iopoll = fp->f_op->iopoll ? ksu_wrapper_iopoll : NULL;
++#endif
+ #if LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0)
+     p->ops.iterate = fp->f_op->iterate ? ksu_wrapper_iterate : NULL;
+ #endif
+@@ -392,7 +396,9 @@ static struct ksu_file_wrapper *ksu_create_file_wrapper(struct file *fp)
+     p->ops.fallocate = fp->f_op->fallocate ? ksu_wrapper_fallocate : NULL;
+     p->ops.show_fdinfo = fp->f_op->show_fdinfo ? ksu_wrapper_show_fdinfo : NULL;
+     p->ops.copy_file_range = fp->f_op->copy_file_range ? ksu_wrapper_copy_file_range : NULL;
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 20, 0)
+     p->ops.remap_file_range = fp->f_op->remap_file_range ? ksu_wrapper_remap_file_range : NULL;
++#endif
+     p->ops.fadvise = fp->f_op->fadvise ? ksu_wrapper_fadvise : NULL;
+ 
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+diff --git a/kernel/infra/seccomp_cache.c b/kernel/infra/seccomp_cache.c
+index a9d2b634..90b9e3e8 100644
+--- a/kernel/infra/seccomp_cache.c
++++ b/kernel/infra/seccomp_cache.c
+@@ -8,6 +8,21 @@
+ #include "klog.h" // IWYU pragma: keep
+ #include "infra/seccomp_cache.h"
+ 
++#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 5, 0)
++/* 4.19 的 struct seccomp_filter 定义在 kernel/seccomp.c，且没有 action_cache
++ * 字段，缓存修改在该版本上无法实现，保留空实现供调用点链接。 */
++void ksu_seccomp_clear_cache(struct seccomp_filter *filter, int nr)
++{
++    (void)filter;
++    (void)nr;
++}
++
++void ksu_seccomp_allow_cache(struct seccomp_filter *filter, int nr)
++{
++    (void)filter;
++    (void)nr;
++}
++#else
+ struct action_cache {
+     DECLARE_BITMAP(allow_native, SECCOMP_ARCH_NATIVE_NR);
+ #ifdef SECCOMP_ARCH_COMPAT
+@@ -63,3 +78,4 @@ void ksu_seccomp_allow_cache(struct seccomp_filter *filter, int nr)
+     }
+ #endif
+ }
++#endif /* LINUX_VERSION_CODE < KERNEL_VERSION(5, 5, 0) */
+diff --git a/kernel/infra/su_mount_ns.c b/kernel/infra/su_mount_ns.c
+index 1b1ab1df..815569dc 100644
+--- a/kernel/infra/su_mount_ns.c
++++ b/kernel/infra/su_mount_ns.c
+@@ -13,11 +13,12 @@
+ #include <linux/syscalls.h>
+ #include <linux/task_work.h>
+ #include <linux/version.h>
+-#include <uapi/linux/mount.h>
++#include <linux/mount.h>
+ 
+ #include "arch.h"
+ #include "klog.h" // IWYU pragma: keep
+ #include "ksu.h"
++#include "infra/symbol_resolver.h"
+ #include "infra/su_mount_ns.h"
+ #include "util.h"
+ 
+@@ -125,7 +126,13 @@ static void ksu_mnt_ns_individual(void)
+     // make root mount private
+     struct path root_path;
+     get_fs_root(current->fs, &root_path);
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)
+     int pm_ret = path_mount(NULL, &root_path, NULL, MS_PRIVATE | MS_REC, NULL);
++#else
++    /* 4.19 无 path_mount()，直接调用内核内部的 do_change_type()。 */
++    int (*do_change_type_fn)(struct path *, int) = (void *)find_kernel_symbol_exact("do_change_type");
++    int pm_ret = do_change_type_fn ? do_change_type_fn(&root_path, MS_PRIVATE | MS_REC) : -ENOENT;
++#endif
+     path_put(&root_path);
+ 
+     if (pm_ret < 0) {
+diff --git a/kernel/manager/pkg_observer.c b/kernel/manager/pkg_observer.c
+index dc785e37..d954a558 100644
+--- a/kernel/manager/pkg_observer.c
++++ b/kernel/manager/pkg_observer.c
+@@ -5,6 +5,7 @@
+ #include <linux/fsnotify_backend.h>
+ #include <linux/sched.h>
+ #include <linux/slab.h>
++#include <linux/string.h>
+ #include <linux/rculist.h>
+ #include <linux/task_work.h>
+ #include <linux/version.h>
+@@ -54,6 +55,7 @@ static void ksu_defer_track_throne(void)
+     track_throne(false);
+ }
+ 
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)
+ static int ksu_handle_inode_event(struct fsnotify_mark *mark, u32 mask, struct inode *inode, struct inode *dir,
+                                   const struct qstr *file_name, u32 cookie)
+ {
+@@ -67,9 +69,30 @@ static int ksu_handle_inode_event(struct fsnotify_mark *mark, u32 mask, struct i
+     }
+     return 0;
+ }
++#else
++/* 4.19 的 fsnotify 钩子是 handle_event()，文件名以 unsigned char * 传入。 */
++static int ksu_handle_event(struct fsnotify_group *group, struct inode *inode, u32 mask, const void *data,
++                            int data_type, const unsigned char *file_name, u32 cookie,
++                            struct fsnotify_iter_info *iter_info)
++{
++    if (!file_name)
++        return 0;
++    if (mask & FS_ISDIR)
++        return 0;
++    if (strlen((const char *)file_name) == 13 && !memcmp(file_name, "packages.list", 13)) {
++        pr_info("packages.list detected: %d\n", mask);
++        ksu_defer_track_throne();
++    }
++    return 0;
++}
++#endif
+ 
+ static const struct fsnotify_ops ksu_ops = {
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)
+     .handle_inode_event = ksu_handle_inode_event,
++#else
++    .handle_event = ksu_handle_event,
++#endif
+ };
+ 
+ static int add_mark_on_inode(struct inode *inode, u32 mask, struct fsnotify_mark **out)
+diff --git a/kernel/manager/throne_tracker.c b/kernel/manager/throne_tracker.c
+index a827212c..41cde7ab 100644
+--- a/kernel/manager/throne_tracker.c
++++ b/kernel/manager/throne_tracker.c
+@@ -328,8 +328,10 @@ void track_throne(bool prune_only)
+     }
+ 
+     if (need_rescan) {
+-        // If the apk path still exists, the verification result won't be changed
+-        if (cached_manager_apk_path[0]) {
++        /* 缓存路径只对已验证通过的管理器有参考价值：appid 无效说明上一次验签
++         * 没过，文件仍然存在也说明不了问题。只凭路径命中就跳过搜索，会让管理器
++         * 换包（升级或重装后旧目录还在）之后再也认不出来，此处必须继续重扫。 */
++        if (cached_manager_apk_path[0] && ksu_is_manager_appid_valid()) {
+             struct path p;
+             int ret = kern_path(cached_manager_apk_path, 0, &p);
+             if (ret == 0) {
+diff --git a/kernel/policy/allowlist.c b/kernel/policy/allowlist.c
+index e5735d67..a77f92ad 100644
+--- a/kernel/policy/allowlist.c
++++ b/kernel/policy/allowlist.c
+@@ -3,6 +3,7 @@
+ #include <linux/rculist.h>
+ #include <linux/mutex.h>
+ #include <linux/task_work.h>
++#include <linux/sched/task.h>
+ #include <linux/capability.h>
+ #include <linux/compiler.h>
+ #include <linux/fs.h>
+@@ -501,7 +502,7 @@ static void migrate_profile(u32 version, struct app_profile *profile)
+                 pr_info("migrated domain of profile: %s\n", profile->key);
+             }
+         }
+-        fallthrough;
++        /* fall through */
+     case 3:
+         if (profile->allow_su) {
+             profile->rp_config.profile.flags = FLAG_KSU_NO_NEW_PRIVS;
+diff --git a/kernel/policy/app_profile.c b/kernel/policy/app_profile.c
+index 10d03262..3ab0c3f6 100644
+--- a/kernel/policy/app_profile.c
++++ b/kernel/policy/app_profile.c
+@@ -101,7 +101,9 @@ static void disable_seccomp(void)
+ 
+     current->seccomp.mode = 0;
+     current->seccomp.filter = NULL;
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)
+     atomic_set(&current->seccomp.filter_count, 0);
++#endif
+     spin_unlock_irq(&current->sighand->siglock);
+ 
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
+@@ -118,7 +120,11 @@ static void disable_seccomp(void)
+     fake->sighand = NULL;
+ #endif
+ 
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)
+     seccomp_filter_release(fake);
++#else
++    put_seccomp_filter(fake);
++#endif
+     kfree(fake);
+ }
+ 
+diff --git a/kernel/selinux/rules.c b/kernel/selinux/rules.c
+index 768b9a26..c7ef9c7d 100644
+--- a/kernel/selinux/rules.c
++++ b/kernel/selinux/rules.c
+@@ -6,6 +6,7 @@
+ #include <linux/lockdep.h>
+ #include <linux/slab.h>
+ #include <linux/string.h>
++#include <linux/vmalloc.h>
+ 
+ #include "uapi/selinux.h"
+ #include "klog.h" // IWYU pragma: keep
+@@ -15,7 +16,11 @@
+ #include "linux/lsm_audit.h" // IWYU pragma: keep
+ #include "xfrm.h"
+ 
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
+ struct selinux_policy *backup_sepolicy;
++#else
++struct ksu_sepolicy_backup *backup_sepolicy;
++#endif
+ 
+ #define SELINUX_POLICY_INSTEAD_SELINUX_SS
+ 
+@@ -42,6 +47,7 @@ static void reset_avc_cache()
+     selinux_xfrm_notify_policyload();
+ }
+ 
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
+ void apply_kernelsu_rules()
+ {
+     struct selinux_policy *pol, *old_pol;
+@@ -164,6 +170,167 @@ void apply_kernelsu_rules()
+ out_unlock:
+     mutex_unlock(&selinux_state.policy_mutex);
+ }
++#else /* LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0) */
++
++/*
++ * 4.19 的 put_entry() 没有缓冲区边界检查（next_entry() 才有），policydb_write()
++ * 会按 policydb->len 直接 memcpy。注入只会让策略变大，len 停在旧值会让
++ * security_read_policy() 读取 /sys/fs/selinux/policy 时写入越界。这里按一次
++ * 真实序列化回填长度。
++ *
++ * scratch 由调用方在取锁前用 vmalloc 分配，容量取策略长度的两倍：单次注入的
++ * 增长量远小于原策略，余量足以覆盖新增节点；policydb_write() 只写调用方缓冲区、
++ * 不做额外分配，可以安全地放在 write_lock_irq 区间内执行。
++ */
++static void ksu_refresh_policydb_len_locked(struct policydb *db, void *scratch, size_t scratch_size)
++{
++    struct policy_file fp;
++    int rc;
++
++    if (!db->policyvers)
++        return;
++
++    if (scratch) {
++        fp.data = scratch;
++        fp.len = scratch_size;
++        rc = policydb_write(db, &fp);
++        if (!rc) {
++            db->len = (size_t)((unsigned long)fp.data - (unsigned long)scratch);
++            return;
++        }
++        pr_warn("sepol: policydb_write failed: %d\n", rc);
++    }
++
++    /* 拿不到准确长度时高估：多占 vmalloc 无害，少算会破坏策略读取缓冲区 */
++    db->len += db->len / 2 + 4096;
++}
++
++/*
++ * 4.19 没有可替换的 selinux_policy 副本，策略与 sidtab 常驻 selinux_state.ss，
++ * 只能原地改写。security_read_policy() 与各条 security_* 查询路径都持
++ * read_lock(&ss->policy_rwlock)，改写期间用内核自身 security_load_policy()
++ * 的同款 write_lock_irq 独占；KSU 侧与 avtab/hashtab 的节点分配都已改为
++ * GFP_ATOMIC，符合关中断区间的分配限制。
++ */
++void apply_kernelsu_rules()
++{
++    struct selinux_ss *ss = selinux_state.ss;
++    struct policydb *db = &ss->policydb;
++    size_t scratch_size;
++    void *scratch;
++
++    if (!getenforce())
++        pr_info("SELinux permissive or disabled, apply rules!\n");
++
++    // selinux_hide 要靠注入前的策略回答应用查询，快照必须在本轮改写之前完成。
++    if (!backup_sepolicy) {
++        backup_sepolicy = ksu_dup_sepolicy_backup(db, ss->latest_granting);
++        if (IS_ERR(backup_sepolicy)) {
++            pr_err("failed to create backup sepolicy: %ld\n", PTR_ERR(backup_sepolicy));
++            backup_sepolicy = NULL;
++        } else {
++            pr_info("backup sepolicy success! latest_granting=%u\n", backup_sepolicy->latest_granting);
++        }
++    }
++
++    scratch_size = db->len * 2 + 4096;
++    scratch = vmalloc(scratch_size);
++    if (!scratch)
++        pr_warn("sepol: no scratch buffer for policy length\n");
++
++    write_lock_irq(&ss->policy_rwlock);
++
++    // 4.19 补丁改自 v0.9.2，旧版复用策略里已有的 su 类型；本版使用独立的 ksu 类型，
++    // 必须先建档，后续域规则才有落点。
++    ksu_type(db, KERNEL_SU_DOMAIN, "domain");
++    ksu_permissive(db, KERNEL_SU_DOMAIN);
++    ksu_typeattribute(db, KERNEL_SU_DOMAIN, "mlstrustedsubject");
++    ksu_typeattribute(db, KERNEL_SU_DOMAIN, "netdomain");
++    ksu_typeattribute(db, KERNEL_SU_DOMAIN, "bluetoothdomain");
++
++    // Create unconstrained file type
++    ksu_type(db, KERNEL_SU_FILE, "file_type");
++    ksu_typeattribute(db, KERNEL_SU_FILE, "mlstrustedobject");
++    ksu_allow(db, ALL, KERNEL_SU_FILE, ALL, ALL);
++
++    // allow all!
++    ksu_allow(db, KERNEL_SU_DOMAIN, ALL, ALL, ALL);
++
++    // allow us do any ioctl
++    if (db->policyvers >= POLICYDB_VERSION_XPERMS_IOCTL) {
++        ksu_allowxperm(db, KERNEL_SU_DOMAIN, ALL, "blk_file", ALL);
++        ksu_allowxperm(db, KERNEL_SU_DOMAIN, ALL, "fifo_file", ALL);
++        ksu_allowxperm(db, KERNEL_SU_DOMAIN, ALL, "chr_file", ALL);
++        ksu_allowxperm(db, KERNEL_SU_DOMAIN, ALL, "file", ALL);
++    }
++
++    // we need to save allowlist in /data/adb/ksu
++    ksu_allow(db, "kernel", "adb_data_file", "dir", ALL);
++    ksu_allow(db, "kernel", "adb_data_file", "file", ALL);
++    // we may need to do mount on shell
++    ksu_allow(db, "kernel", "shell_data_file", "file", ALL);
++    // we need to read /data/system/packages.list
++    ksu_allow(db, "kernel", "kernel", "capability", "dac_override");
++    ksu_allow(db, "kernel", "packages_list_file", "file", ALL);
++    ksu_allow(db, "kernel", "packages_list_file", "dir", ALL);
++    ksu_allow(db, "kernel", "system_data_file", "file", ALL);
++    ksu_allow(db, "kernel", "system_data_file", "dir", ALL);
++    // our ksud triggered by init
++    ksu_allow(db, "init", "adb_data_file", "file", ALL);
++    ksu_allow(db, "init", "adb_data_file", "dir", ALL);
++    ksu_allow(db, "init", KERNEL_SU_DOMAIN, ALL, ALL);
++    // we need to umount modules in zygote
++    ksu_allow(db, "zygote", "adb_data_file", "dir", "search");
++
++    // copied from Magisk rules
++    ksu_allow(db, "servicemanager", KERNEL_SU_DOMAIN, "dir", "search");
++    ksu_allow(db, "servicemanager", KERNEL_SU_DOMAIN, "dir", "read");
++    ksu_allow(db, "servicemanager", KERNEL_SU_DOMAIN, "file", "open");
++    ksu_allow(db, "servicemanager", KERNEL_SU_DOMAIN, "file", "read");
++    ksu_allow(db, "servicemanager", KERNEL_SU_DOMAIN, "process", "getattr");
++    ksu_allow(db, ALL, KERNEL_SU_DOMAIN, "process", "sigchld");
++
++    // allowLog
++    ksu_allow(db, "logd", KERNEL_SU_DOMAIN, "dir", "search");
++    ksu_allow(db, "logd", KERNEL_SU_DOMAIN, "file", "read");
++    ksu_allow(db, "logd", KERNEL_SU_DOMAIN, "file", "open");
++    ksu_allow(db, "logd", KERNEL_SU_DOMAIN, "file", "getattr");
++
++    // dumpsys
++    ksu_allow(db, ALL, KERNEL_SU_DOMAIN, "fd", "use");
++    ksu_allow(db, ALL, KERNEL_SU_DOMAIN, "fifo_file", "write");
++    ksu_allow(db, ALL, KERNEL_SU_DOMAIN, "fifo_file", "read");
++    ksu_allow(db, ALL, KERNEL_SU_DOMAIN, "fifo_file", "open");
++    ksu_allow(db, ALL, KERNEL_SU_DOMAIN, "fifo_file", "getattr");
++
++    // bootctl
++    ksu_allow(db, "hwservicemanager", KERNEL_SU_DOMAIN, "dir", "search");
++    ksu_allow(db, "hwservicemanager", KERNEL_SU_DOMAIN, "file", "read");
++    ksu_allow(db, "hwservicemanager", KERNEL_SU_DOMAIN, "file", "open");
++    ksu_allow(db, "hwservicemanager", KERNEL_SU_DOMAIN, "process", "getattr");
++
++    // For mounting loop devices, mirrors, tmpfs
++    ksu_allow(db, "kernel", ALL, "file", "read");
++    ksu_allow(db, "kernel", ALL, "file", "write");
++
++    // Allow all binder transactions
++    ksu_allow(db, ALL, KERNEL_SU_DOMAIN, "binder", ALL);
++
++    // Allow system server devpts
++    ksu_allow(db, "system_server", "untrusted_app_all_devpts", "chr_file", "read");
++    ksu_allow(db, "system_server", "untrusted_app_all_devpts", "chr_file", "write");
++
++    // Allow system server kill su process
++    ksu_allow(db, "system_server", KERNEL_SU_DOMAIN, "process", "getpgid");
++    ksu_allow(db, "system_server", KERNEL_SU_DOMAIN, "process", "sigkill");
++
++    ksu_refresh_policydb_len_locked(db, scratch, scratch_size);
++    write_unlock_irq(&ss->policy_rwlock);
++    vfree(scratch);
++
++    reset_avc_cache();
++}
++#endif
+ 
+ #define KSU_SEPOLICY_MAX_BATCH_SIZE (8U * 1024U * 1024U)
+ #define KSU_SEPOLICY_MAX_ARGS 5
+@@ -430,6 +597,7 @@ static int apply_one_sepolicy_cmd(struct policydb *db, const struct sepol_data *
+     }
+ }
+ 
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)
+ int handle_sepolicy(void __user *user_data, u64 data_len)
+ {
+     struct selinux_policy *pol, *old_pol;
+@@ -532,3 +700,107 @@ out_free:
+ 
+     return ret;
+ }
++#else /* LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0) */
++/*
++ * 4.19 的策略没有可替换副本，注入直接改写 selinux_state.ss->policydb。
++ * 原地改写没有回滚手段：协议解析中途出错时，已经应用的命令保留，返回值反映
++ * 解析结果。
++ */
++int handle_sepolicy(void __user *user_data, u64 data_len)
++{
++    struct selinux_ss *ss;
++    struct policydb *db;
++    struct sepol_batch_cursor cursor;
++    u8 *payload;
++    void *scratch = NULL;
++    size_t scratch_size = 0;
++    int ret;
++    int parse_ret = 0;
++    int success_cmd_count = 0;
++    u32 cmd_index = 0;
++
++    if (!user_data || !data_len)
++        return -EINVAL;
++
++    if (data_len > KSU_SEPOLICY_MAX_BATCH_SIZE)
++        return -E2BIG;
++
++    payload = vmalloc((size_t)data_len);
++    if (!payload)
++        return -ENOMEM;
++
++    if (copy_from_user(payload, user_data, (size_t)data_len)) {
++        ret = -EFAULT;
++        goto out_free;
++    }
++
++    if (!getenforce())
++        pr_info("SELinux permissive or disabled when handle policy!\n");
++
++    ss = selinux_state.ss;
++    db = &ss->policydb;
++
++    scratch_size = db->len * 2 + 4096;
++    scratch = vmalloc(scratch_size);
++    if (!scratch)
++        pr_warn("sepol: no scratch buffer for policy length\n");
++
++    write_lock_irq(&ss->policy_rwlock);
++
++    cursor.cur = payload;
++    cursor.end = payload + (size_t)data_len;
++
++    while (cursor.cur < cursor.end) {
++        struct sepol_data header;
++        const char *args[KSU_SEPOLICY_MAX_ARGS] = { 0 };
++        u32 arg_index;
++        int expected_argc;
++
++        parse_ret = sepol_read_cmd_header(&cursor, &header);
++        if (parse_ret < 0) {
++            pr_err("sepol: failed to read cmd header #%u.\n", cmd_index);
++            break;
++        }
++
++        expected_argc = sepol_expected_argc(header.cmd);
++        if (expected_argc < 0 || expected_argc > KSU_SEPOLICY_MAX_ARGS) {
++            parse_ret = -EINVAL;
++            pr_err("sepol: invalid cmd header #%u.\n", cmd_index);
++            break;
++        }
++
++        for (arg_index = 0; arg_index < (u32)expected_argc; arg_index++) {
++            parse_ret = sepol_read_string(&cursor, &args[arg_index]);
++            if (parse_ret < 0) {
++                pr_err("sepol: failed to read cmd #%u arg #%u.\n", cmd_index, arg_index);
++                break;
++            }
++        }
++        if (parse_ret < 0)
++            break;
++
++        if (apply_one_sepolicy_cmd(db, &header, args) < 0)
++            pr_err("sepol: cmd #%u failed, cmd=%u subcmd=%u.\n", cmd_index, header.cmd, header.subcmd);
++        else
++            success_cmd_count++;
++        cmd_index++;
++    }
++
++    if (cmd_index > 0)
++        ksu_refresh_policydb_len_locked(db, scratch, scratch_size);
++
++    write_unlock_irq(&ss->policy_rwlock);
++    vfree(scratch);
++
++    /* 原地改写没有回滚手段，已经写入的策略必须让 avc 立即失效 */
++    if (cmd_index > 0)
++        reset_avc_cache();
++
++    ret = parse_ret < 0 ? parse_ret : success_cmd_count;
++
++out_free:
++    vfree(payload);
++
++    return ret;
++}
++#endif
+diff --git a/kernel/selinux/sepolicy.c b/kernel/selinux/sepolicy.c
+index b00e5175..8ef6a6a8 100644
+--- a/kernel/selinux/sepolicy.c
++++ b/kernel/selinux/sepolicy.c
+@@ -1,57 +1,73 @@
+-#include "ss/avtab.h"
+-#include "ss/constraint.h"
+-#include "ss/ebitmap.h"
+-#include "ss/hashtab.h"
+-#include "ss/policydb.h"
+-#include "ss/services.h"
+-#include <linux/gfp.h>
+-#include <linux/printk.h>
+-#include <linux/slab.h>
+-#include <linux/version.h>
+-#include <linux/vmalloc.h>
+-
+ #include "sepolicy.h"
++#include "linux/err.h"
++#include "linux/gfp.h"
++#include "linux/printk.h"
++#include "linux/slab.h"
++#include "linux/version.h"
++#include "linux/vmalloc.h"
++
+ #include "klog.h" // IWYU pragma: keep
+ #include "ss/symtab.h"
+ 
+ #define KSU_SUPPORT_ADD_TYPE
+ 
++/*
++ * Adapt to Huawei HISI kernel without affecting other kernels ,
++ * Huawei Hisi Kernel EBITMAP Enable or Disable Flag ,
++ * From ss/ebitmap.h
++ */
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(4, 9, 0) &&                           \
++		LINUX_VERSION_CODE < KERNEL_VERSION(4, 10, 0) ||               \
++	LINUX_VERSION_CODE >= KERNEL_VERSION(4, 14, 0) &&                      \
++		LINUX_VERSION_CODE < KERNEL_VERSION(4, 15, 0)
++#ifdef HISI_SELINUX_EBITMAP_RO
++#define CONFIG_IS_HW_HISI
++#endif
++#endif
++
+ //////////////////////////////////////////////////////
+ // Declaration
+ //////////////////////////////////////////////////////
+ 
+-static struct avtab_node *get_avtab_node(struct policydb *db, struct avtab_key *key,
+-                                         struct avtab_extended_perms *xperms);
+-
+-static bool is_redundant_avtab_node(struct avtab_node *node);
++static struct avtab_node *get_avtab_node(struct policydb *db,
++					 struct avtab_key *key,
++					 struct avtab_extended_perms *xperms);
+ 
+-static bool remove_avtab_node(struct policydb *db, struct avtab_node *node);
++static bool add_rule(struct policydb *db, const char *s, const char *t,
++		     const char *c, const char *p, int effect, bool invert);
+ 
+-static bool add_rule(struct policydb *db, const char *s, const char *t, const char *c, const char *p, int effect,
+-                     bool invert);
++static void add_rule_raw(struct policydb *db, struct type_datum *src,
++			 struct type_datum *tgt, struct class_datum *cls,
++			 struct perm_datum *perm, int effect, bool invert);
+ 
+-static bool add_rule_raw(struct policydb *db, struct type_datum *src, struct type_datum *tgt, struct class_datum *cls,
+-                         struct perm_datum *perm, int effect, bool invert);
++static void add_xperm_rule_raw(struct policydb *db, struct type_datum *src,
++			       struct type_datum *tgt, struct class_datum *cls,
++			       uint16_t low, uint16_t high, int effect,
++			       bool invert);
++static bool add_xperm_rule(struct policydb *db, const char *s, const char *t,
++			   const char *c, const char *range, int effect,
++			   bool invert);
+ 
+-static void add_xperm_rule_raw(struct policydb *db, struct type_datum *src, struct type_datum *tgt,
+-                               struct class_datum *cls, uint16_t low, uint16_t high, int effect, bool invert);
+-static bool add_xperm_rule(struct policydb *db, const char *s, const char *t, const char *c, const char *range,
+-                           int effect, bool invert);
++static bool add_type_rule(struct policydb *db, const char *s, const char *t,
++			  const char *c, const char *d, int effect);
+ 
+-static bool add_type_rule(struct policydb *db, const char *s, const char *t, const char *c, const char *d, int effect);
++static bool add_filename_trans(struct policydb *db, const char *s,
++			       const char *t, const char *c, const char *d,
++			       const char *o);
+ 
+-static bool add_filename_trans(struct policydb *db, const char *s, const char *t, const char *c, const char *d,
+-                               const char *o);
+-
+-static bool add_genfscon(struct policydb *db, const char *fs_name, const char *path, const char *context);
++static bool add_genfscon(struct policydb *db, const char *fs_name,
++			 const char *path, const char *context);
+ 
+ static bool add_type(struct policydb *db, const char *type_name, bool attr);
+ 
+-static bool set_type_state(struct policydb *db, const char *type_name, bool permissive);
++static bool set_type_state(struct policydb *db, const char *type_name,
++			   bool permissive);
+ 
+-static void add_typeattribute_raw(struct policydb *db, struct type_datum *type, struct type_datum *attr);
++static void add_typeattribute_raw(struct policydb *db, struct type_datum *type,
++				  struct type_datum *attr);
+ 
+-static bool add_typeattribute(struct policydb *db, const char *type, const char *attr);
++static bool add_typeattribute(struct policydb *db, const char *type,
++			      const char *attr);
+ 
+ //////////////////////////////////////////////////////
+ // Implementation
+@@ -61,17 +77,19 @@ static bool add_typeattribute(struct policydb *db, const char *type, const char
+ // rules
+ #define strip_av(effect, invert) ((effect == AVTAB_AUDITDENY) == !invert)
+ 
+-#define ksu_hash_for_each(node_ptr, n_slot, cur)                                                                       \
+-    int i;                                                                                                             \
+-    for (i = 0; i < n_slot; ++i)                                                                                       \
+-        for (cur = node_ptr[i]; cur; cur = cur->next)
++#define ksu_hash_for_each(node_ptr, n_slot, cur)                               \
++	int i;                                                                 \
++	for (i = 0; i < n_slot; ++i)                                           \
++		for (cur = node_ptr[i]; cur; cur = cur->next)
+ 
+ // htable is a struct instead of pointer above 5.8.0:
+ // https://elixir.bootlin.com/linux/v5.8-rc1/source/security/selinux/ss/symtab.h
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 8, 0)
+-#define ksu_hashtab_for_each(htab, cur) ksu_hash_for_each(htab.htable, htab.size, cur)
++#define ksu_hashtab_for_each(htab, cur)                                        \
++	ksu_hash_for_each(htab.htable, htab.size, cur)
+ #else
+-#define ksu_hashtab_for_each(htab, cur) ksu_hash_for_each(htab->htable, htab->size, cur)
++#define ksu_hashtab_for_each(htab, cur)                                        \
++	ksu_hash_for_each(htab->htable, htab->size, cur)
+ #endif
+ 
+ // symtab_search is introduced on 5.9.0:
+@@ -81,248 +99,193 @@ static bool add_typeattribute(struct policydb *db, const char *type, const char
+ #define symtab_insert(s, name, datum) hashtab_insert((s)->table, name, datum)
+ #endif
+ 
+-#define avtab_for_each(avtab, cur) ksu_hash_for_each(avtab.htable, avtab.nslot, cur)
+-
+-static struct avtab_node *get_avtab_node(struct policydb *db, struct avtab_key *key,
+-                                         struct avtab_extended_perms *xperms)
+-{
+-    struct avtab_node *node;
+-
+-    /* AVTAB_XPERMS entries are not necessarily unique */
+-    if (key->specified & AVTAB_XPERMS) {
+-        bool match = false;
+-        node = avtab_search_node(&db->te_avtab, key);
+-        while (node) {
+-            if ((node->datum.u.xperms->specified == xperms->specified) &&
+-                (node->datum.u.xperms->driver == xperms->driver)) {
+-                match = true;
+-                break;
+-            }
+-            node = avtab_search_node_next(node, key->specified);
+-        }
+-        if (!match)
+-            node = NULL;
+-    } else {
+-        node = avtab_search_node(&db->te_avtab, key);
+-    }
+-
+-    if (!node) {
+-        struct avtab_datum avdatum = {};
+-        /*
++#define avtab_for_each(avtab, cur)                                             \
++	ksu_hash_for_each(avtab.htable, avtab.nslot, cur);
++
++static struct avtab_node *get_avtab_node(struct policydb *db,
++					 struct avtab_key *key,
++					 struct avtab_extended_perms *xperms)
++{
++	struct avtab_node *node;
++
++	/* AVTAB_XPERMS entries are not necessarily unique */
++	if (key->specified & AVTAB_XPERMS) {
++		bool match = false;
++		node = avtab_search_node(&db->te_avtab, key);
++		while (node) {
++			if ((node->datum.u.xperms->specified ==
++			     xperms->specified) &&
++			    (node->datum.u.xperms->driver == xperms->driver)) {
++				match = true;
++				break;
++			}
++			node = avtab_search_node_next(node, key->specified);
++		}
++		if (!match)
++			node = NULL;
++	} else {
++		node = avtab_search_node(&db->te_avtab, key);
++	}
++
++	if (!node) {
++		struct avtab_datum avdatum = {};
++		/*
+      * AUDITDENY, aka DONTAUDIT, are &= assigned, versus |= for
+      * others. Initialize the data accordingly.
+      */
+-        if (key->specified & AVTAB_XPERMS) {
+-            avdatum.u.xperms = xperms;
+-        } else {
+-            avdatum.u.data = key->specified == AVTAB_AUDITDENY ? ~0U : 0U;
+-        }
+-        /* this is used to get the node - insertion is actually unique */
+-        node = avtab_insert_nonunique(&db->te_avtab, key, &avdatum);
+-        if (!node)
+-            return NULL;
+-
+-        // extra size: add_type() can grow policy without updating db->len
+-        int grow_size = sizeof(struct avtab_key);
+-        grow_size += sizeof(struct avtab_datum);
+-        if (key->specified & AVTAB_XPERMS) {
+-            grow_size += sizeof(avdatum.u.xperms->specified) + sizeof(avdatum.u.xperms->driver) +
+-                         sizeof(avdatum.u.xperms->perms.p);
+-        }
+-        db->len += grow_size;
+-    }
+-
+-    return node;
+-}
+-
+-static bool is_redundant_avtab_node(struct avtab_node *node)
+-{
+-    if (node->key.specified & AVTAB_XPERMS)
+-        return node->datum.u.xperms == NULL;
+-    if (!(node->key.specified & AVTAB_AV))
+-        return false;
+-    if (node->key.specified & AVTAB_AUDITDENY)
+-        return node->datum.u.data == ~0U;
+-    return node->datum.u.data == 0U;
+-}
+-
+-static bool remove_avtab_node(struct policydb *db, struct avtab_node *node)
+-{
+-    int i;
+-    int ret;
+-    // https://github.com/torvalds/linux/blob/v6.1/security/selinux/ss/avtab.c#L619
+-    int shrink_size = sizeof(node->key.source_type) + sizeof(node->key.target_type) + sizeof(node->key.target_class) +
+-                      sizeof(node->key.specified);
+-    struct avtab removed = {};
+-    struct avtab_node *n;
+-    struct avtab_node *prev;
+-
+-    ret = avtab_alloc(&removed, 1);
+-    if (ret < 0)
+-        return false;
+-
+-    for (i = 0; i < db->te_avtab.nslot; i++) {
+-        prev = NULL;
+-        for (n = db->te_avtab.htable[i]; n; prev = n, n = n->next) {
+-            if (n != node)
+-                continue;
+-
+-            if (prev)
+-                prev->next = n->next;
+-            else
+-                db->te_avtab.htable[i] = n->next;
+-
+-            if (db->te_avtab.nel > 0)
+-                db->te_avtab.nel--;
+-
+-            if (n->key.specified & AVTAB_XPERMS)
+-                // specified and driver are u8, perms.p holds 8 u32s
+-                shrink_size += sizeof(n->datum.u.xperms->specified) + sizeof(n->datum.u.xperms->driver) +
+-                               sizeof(n->datum.u.xperms->perms.p);
+-            else
+-                // data is u32
+-                shrink_size += sizeof(n->datum.u.data);
+-            n->next = NULL;
+-            removed.htable[0] = n;
+-            removed.nel = 1;
+-            avtab_destroy(&removed);
+-            if (db->len >= shrink_size)
+-                db->len -= shrink_size;
+-            return true;
+-        }
+-    }
+-
+-    avtab_destroy(&removed);
+-    return false;
+-}
+-
+-static bool add_rule(struct policydb *db, const char *s, const char *t, const char *c, const char *p, int effect,
+-                     bool invert)
+-{
+-    struct type_datum *src = NULL, *tgt = NULL;
+-    struct class_datum *cls = NULL;
+-    struct perm_datum *perm = NULL;
+-
+-    if (s) {
+-        src = symtab_search(&db->p_types, s);
+-        if (src == NULL) {
+-            pr_info("source type %s does not exist\n", s);
+-            return false;
+-        }
+-    }
+-
+-    if (t) {
+-        tgt = symtab_search(&db->p_types, t);
+-        if (tgt == NULL) {
+-            pr_info("target type %s does not exist\n", t);
+-            return false;
+-        }
+-    }
+-
+-    if (c) {
+-        cls = symtab_search(&db->p_classes, c);
+-        if (cls == NULL) {
+-            pr_info("class %s does not exist\n", c);
+-            return false;
+-        }
+-    }
+-
+-    if (p) {
+-        if (c == NULL) {
+-            pr_info("No class is specified, cannot add perm [%s] \n", p);
+-            return false;
+-        }
+-
+-        perm = symtab_search(&cls->permissions, p);
+-        if (perm == NULL && cls->comdatum != NULL) {
+-            perm = symtab_search(&cls->comdatum->permissions, p);
+-        }
+-        if (perm == NULL) {
+-            pr_info("perm %s does not exist in class %s\n", p, c);
+-            return false;
+-        }
+-    }
+-    return add_rule_raw(db, src, tgt, cls, perm, effect, invert);
+-}
+-
+-static bool add_rule_raw(struct policydb *db, struct type_datum *src, struct type_datum *tgt, struct class_datum *cls,
+-                         struct perm_datum *perm, int effect, bool invert)
+-{
+-    bool success = true;
+-
+-    if (src == NULL) {
+-        struct hashtab_node *node;
+-        if (strip_av(effect, invert)) {
+-            ksu_hashtab_for_each(db->p_types.table, node)
+-            {
+-                success &= add_rule_raw(db, (struct type_datum *)node->datum, tgt, cls, perm, effect, invert);
+-            };
+-        } else {
+-            ksu_hashtab_for_each(db->p_types.table, node)
+-            {
+-                struct type_datum *type = (struct type_datum *)(node->datum);
+-                if (type->attribute) {
+-                    success &= add_rule_raw(db, type, tgt, cls, perm, effect, invert);
+-                }
+-            };
+-        }
+-    } else if (tgt == NULL) {
+-        struct hashtab_node *node;
+-        if (strip_av(effect, invert)) {
+-            ksu_hashtab_for_each(db->p_types.table, node)
+-            {
+-                success &= add_rule_raw(db, src, (struct type_datum *)node->datum, cls, perm, effect, invert);
+-            };
+-        } else {
+-            ksu_hashtab_for_each(db->p_types.table, node)
+-            {
+-                struct type_datum *type = (struct type_datum *)(node->datum);
+-                if (type->attribute) {
+-                    success &= add_rule_raw(db, src, type, cls, perm, effect, invert);
+-                }
+-            };
+-        }
+-    } else if (cls == NULL) {
+-        struct hashtab_node *node;
+-        ksu_hashtab_for_each(db->p_classes.table, node)
+-        {
+-            success &= add_rule_raw(db, src, tgt, (struct class_datum *)node->datum, perm, effect, invert);
+-        }
+-    } else {
+-        struct avtab_key key;
+-        struct avtab_node *node;
+-
+-        key.source_type = src->value;
+-        key.target_type = tgt->value;
+-        key.target_class = cls->value;
+-        key.specified = effect;
+-
+-        if (invert && effect != AVTAB_AUDITDENY) {
+-            node = avtab_search_node(&db->te_avtab, &key);
+-            if (!node)
+-                return true;
+-        } else {
+-            node = get_avtab_node(db, &key, NULL);
+-            if (!node)
+-                return false;
+-        }
+-
+-        if (invert) {
+-            if (perm)
+-                node->datum.u.data &= ~(1U << (perm->value - 1));
+-            else
+-                node->datum.u.data = 0U;
+-        } else {
+-            if (perm)
+-                node->datum.u.data |= 1U << (perm->value - 1);
+-            else
+-                node->datum.u.data = ~0U;
+-        }
+-        if (is_redundant_avtab_node(node))
+-            return remove_avtab_node(db, node);
+-    }
+-
+-    return success;
++		if (key->specified & AVTAB_XPERMS) {
++			avdatum.u.xperms = xperms;
++		} else {
++			avdatum.u.data =
++				key->specified == AVTAB_AUDITDENY ? ~0U : 0U;
++		}
++		/* this is used to get the node - insertion is actually unique */
++		node = avtab_insert_nonunique(&db->te_avtab, key, &avdatum);
++
++		int grow_size = sizeof(struct avtab_key);
++		grow_size += sizeof(struct avtab_datum);
++		if (key->specified & AVTAB_XPERMS) {
++			grow_size += sizeof(u8);
++			grow_size += sizeof(u8);
++			grow_size += sizeof(u32) *
++				     ARRAY_SIZE(avdatum.u.xperms->perms.p);
++		}
++		db->len += grow_size;
++	}
++
++	return node;
++}
++
++static bool add_rule(struct policydb *db, const char *s, const char *t,
++		     const char *c, const char *p, int effect, bool invert)
++{
++	struct type_datum *src = NULL, *tgt = NULL;
++	struct class_datum *cls = NULL;
++	struct perm_datum *perm = NULL;
++
++	if (s) {
++		src = symtab_search(&db->p_types, s);
++		if (src == NULL) {
++			pr_info("source type %s does not exist\n", s);
++			return false;
++		}
++	}
++
++	if (t) {
++		tgt = symtab_search(&db->p_types, t);
++		if (tgt == NULL) {
++			pr_info("target type %s does not exist\n", t);
++			return false;
++		}
++	}
++
++	if (c) {
++		cls = symtab_search(&db->p_classes, c);
++		if (cls == NULL) {
++			pr_info("class %s does not exist\n", c);
++			return false;
++		}
++	}
++
++	if (p) {
++		if (c == NULL) {
++			pr_info("No class is specified, cannot add perm [%s] \n",
++				p);
++			return false;
++		}
++
++		perm = symtab_search(&cls->permissions, p);
++		if (perm == NULL && cls->comdatum != NULL) {
++			perm = symtab_search(&cls->comdatum->permissions, p);
++		}
++		if (perm == NULL) {
++			pr_info("perm %s does not exist in class %s\n", p, c);
++			return false;
++		}
++	}
++	add_rule_raw(db, src, tgt, cls, perm, effect, invert);
++	return true;
++}
++
++static void add_rule_raw(struct policydb *db, struct type_datum *src,
++			 struct type_datum *tgt, struct class_datum *cls,
++			 struct perm_datum *perm, int effect, bool invert)
++{
++	if (src == NULL) {
++		struct hashtab_node *node;
++		if (strip_av(effect, invert)) {
++			ksu_hashtab_for_each(db->p_types.table, node)
++			{
++				add_rule_raw(db,
++					     (struct type_datum *)node->datum,
++					     tgt, cls, perm, effect, invert);
++			};
++		} else {
++			ksu_hashtab_for_each(db->p_types.table, node)
++			{
++				struct type_datum *type =
++					(struct type_datum *)(node->datum);
++				if (type->attribute) {
++					add_rule_raw(db, type, tgt, cls, perm,
++						     effect, invert);
++				}
++			};
++		}
++	} else if (tgt == NULL) {
++		struct hashtab_node *node;
++		if (strip_av(effect, invert)) {
++			ksu_hashtab_for_each(db->p_types.table, node)
++			{
++				add_rule_raw(db, src,
++					     (struct type_datum *)node->datum,
++					     cls, perm, effect, invert);
++			};
++		} else {
++			ksu_hashtab_for_each(db->p_types.table, node)
++			{
++				struct type_datum *type =
++					(struct type_datum *)(node->datum);
++				if (type->attribute) {
++					add_rule_raw(db, src, type, cls, perm,
++						     effect, invert);
++				}
++			};
++		}
++	} else if (cls == NULL) {
++		struct hashtab_node *node;
++		ksu_hashtab_for_each(db->p_classes.table, node)
++		{
++			add_rule_raw(db, src, tgt,
++				     (struct class_datum *)node->datum, perm,
++				     effect, invert);
++		}
++	} else {
++		struct avtab_key key;
++		key.source_type = src->value;
++		key.target_type = tgt->value;
++		key.target_class = cls->value;
++		key.specified = effect;
++
++		struct avtab_node *node = get_avtab_node(db, &key, NULL);
++
++		/* 关中断区间内分配可能失败，缺节点时放弃本条，避免解引用空指针 */
++		if (!node) {
++			pr_err("add_rule_raw: cannot get avtab node\n");
++			return;
++		}
++		if (invert) {
++			if (perm)
++				node->datum.u.data &=
++					~(1U << (perm->value - 1));
++			else
++				node->datum.u.data = 0U;
++		} else {
++			if (perm)
++				node->datum.u.data |= 1U << (perm->value - 1);
++			else
++				node->datum.u.data = ~0U;
++		}
++	}
+ }
+ 
+ #define ioctl_driver(x) (x >> 8 & 0xFF)
+@@ -332,168 +295,189 @@ static bool add_rule_raw(struct policydb *db, struct type_datum *src, struct typ
+ #define xperm_set(x, p) (p[x >> 5] |= (1 << (x & 0x1f)))
+ #define xperm_clear(x, p) (p[x >> 5] &= ~(1 << (x & 0x1f)))
+ 
+-static void add_xperm_rule_raw(struct policydb *db, struct type_datum *src, struct type_datum *tgt,
+-                               struct class_datum *cls, uint16_t low, uint16_t high, int effect, bool invert)
+-{
+-    if (src == NULL) {
+-        struct hashtab_node *node;
+-        ksu_hashtab_for_each(db->p_types.table, node)
+-        {
+-            struct type_datum *type = (struct type_datum *)(node->datum);
+-            if (type->attribute) {
+-                add_xperm_rule_raw(db, type, tgt, cls, low, high, effect, invert);
+-            }
+-        };
+-    } else if (tgt == NULL) {
+-        struct hashtab_node *node;
+-        ksu_hashtab_for_each(db->p_types.table, node)
+-        {
+-            struct type_datum *type = (struct type_datum *)(node->datum);
+-            if (type->attribute) {
+-                add_xperm_rule_raw(db, src, type, cls, low, high, effect, invert);
+-            }
+-        };
+-    } else if (cls == NULL) {
+-        struct hashtab_node *node;
+-        ksu_hashtab_for_each(db->p_classes.table, node)
+-        {
+-            add_xperm_rule_raw(db, src, tgt, (struct class_datum *)(node->datum), low, high, effect, invert);
+-        };
+-    } else {
+-        struct avtab_key key;
+-        key.source_type = src->value;
+-        key.target_type = tgt->value;
+-        key.target_class = cls->value;
+-        key.specified = effect;
+-
+-        struct avtab_datum *datum;
+-        struct avtab_node *node;
+-        struct avtab_extended_perms xperms;
+-
+-        memset(&xperms, 0, sizeof(xperms));
+-        if (ioctl_driver(low) != ioctl_driver(high)) {
+-            xperms.specified = AVTAB_XPERMS_IOCTLDRIVER;
+-            xperms.driver = 0;
+-        } else {
+-            xperms.specified = AVTAB_XPERMS_IOCTLFUNCTION;
+-            xperms.driver = ioctl_driver(low);
+-        }
+-        int i;
+-        if (xperms.specified == AVTAB_XPERMS_IOCTLDRIVER) {
+-            for (i = ioctl_driver(low); i <= ioctl_driver(high); ++i) {
+-                if (invert)
+-                    xperm_clear(i, xperms.perms.p);
+-                else
+-                    xperm_set(i, xperms.perms.p);
+-            }
+-        } else {
+-            for (i = ioctl_func(low); i <= ioctl_func(high); ++i) {
+-                if (invert)
+-                    xperm_clear(i, xperms.perms.p);
+-                else
+-                    xperm_set(i, xperms.perms.p);
+-            }
+-        }
+-
+-        node = get_avtab_node(db, &key, &xperms);
+-        if (!node) {
+-            pr_warn("add_xperm_rule_raw cannot found node!\n");
+-            return;
+-        }
+-        datum = &node->datum;
+-
+-        // Allow updating permission bits of existing xperms
+-        for (i = 0; i < ARRAY_SIZE(xperms.perms.p); i++)
+-            datum->u.xperms->perms.p[i] |= xperms.perms.p[i];
+-    }
+-}
+-
+-static bool add_xperm_rule(struct policydb *db, const char *s, const char *t, const char *c, const char *range,
+-                           int effect, bool invert)
+-{
+-    struct type_datum *src = NULL, *tgt = NULL;
+-    struct class_datum *cls = NULL;
+-
+-    if (s) {
+-        src = symtab_search(&db->p_types, s);
+-        if (src == NULL) {
+-            pr_info("source type %s does not exist\n", s);
+-            return false;
+-        }
+-    }
+-
+-    if (t) {
+-        tgt = symtab_search(&db->p_types, t);
+-        if (tgt == NULL) {
+-            pr_info("target type %s does not exist\n", t);
+-            return false;
+-        }
+-    }
+-
+-    if (c) {
+-        cls = symtab_search(&db->p_classes, c);
+-        if (cls == NULL) {
+-            pr_info("class %s does not exist\n", c);
+-            return false;
+-        }
+-    }
+-
+-    u16 low, high;
+-
+-    if (range) {
+-        if (strchr(range, '-')) {
+-            sscanf(range, "%hx-%hx", &low, &high);
+-        } else {
+-            sscanf(range, "%hx", &low);
+-            high = low;
+-        }
+-    } else {
+-        low = 0;
+-        high = 0xFFFF;
+-    }
+-
+-    add_xperm_rule_raw(db, src, tgt, cls, low, high, effect, invert);
+-    return true;
+-}
+-
+-static bool add_type_rule(struct policydb *db, const char *s, const char *t, const char *c, const char *d, int effect)
+-{
+-    struct type_datum *src, *tgt, *def;
+-    struct class_datum *cls;
+-
+-    src = symtab_search(&db->p_types, s);
+-    if (src == NULL) {
+-        pr_info("source type %s does not exist\n", s);
+-        return false;
+-    }
+-    tgt = symtab_search(&db->p_types, t);
+-    if (tgt == NULL) {
+-        pr_info("target type %s does not exist\n", t);
+-        return false;
+-    }
+-    cls = symtab_search(&db->p_classes, c);
+-    if (cls == NULL) {
+-        pr_info("class %s does not exist\n", c);
+-        return false;
+-    }
+-    def = symtab_search(&db->p_types, d);
+-    if (def == NULL) {
+-        pr_info("default type %s does not exist\n", d);
+-        return false;
+-    }
+-
+-    struct avtab_key key;
+-    key.source_type = src->value;
+-    key.target_type = tgt->value;
+-    key.target_class = cls->value;
+-    key.specified = effect;
+-
+-    struct avtab_node *node = get_avtab_node(db, &key, NULL);
+-    if (!node)
+-        return false;
+-    node->datum.u.data = def->value;
+-
+-    return true;
++static void add_xperm_rule_raw(struct policydb *db, struct type_datum *src,
++			       struct type_datum *tgt, struct class_datum *cls,
++			       uint16_t low, uint16_t high, int effect,
++			       bool invert)
++{
++	if (src == NULL) {
++		struct hashtab_node *node;
++		ksu_hashtab_for_each(db->p_types.table, node)
++		{
++			struct type_datum *type =
++				(struct type_datum *)(node->datum);
++			if (type->attribute) {
++				add_xperm_rule_raw(db, type, tgt, cls, low,
++						   high, effect, invert);
++			}
++		};
++	} else if (tgt == NULL) {
++		struct hashtab_node *node;
++		ksu_hashtab_for_each(db->p_types.table, node)
++		{
++			struct type_datum *type =
++				(struct type_datum *)(node->datum);
++			if (type->attribute) {
++				add_xperm_rule_raw(db, src, type, cls, low,
++						   high, effect, invert);
++			}
++		};
++	} else if (cls == NULL) {
++		struct hashtab_node *node;
++		ksu_hashtab_for_each(db->p_classes.table, node)
++		{
++			add_xperm_rule_raw(db, src, tgt,
++					   (struct class_datum *)(node->datum),
++					   low, high, effect, invert);
++		};
++	} else {
++		struct avtab_key key;
++		key.source_type = src->value;
++		key.target_type = tgt->value;
++		key.target_class = cls->value;
++		key.specified = effect;
++
++		struct avtab_datum *datum;
++		struct avtab_node *node;
++		struct avtab_extended_perms xperms;
++
++		memset(&xperms, 0, sizeof(xperms));
++		if (ioctl_driver(low) != ioctl_driver(high)) {
++			xperms.specified = AVTAB_XPERMS_IOCTLDRIVER;
++			xperms.driver = 0;
++		} else {
++			xperms.specified = AVTAB_XPERMS_IOCTLFUNCTION;
++			xperms.driver = ioctl_driver(low);
++		}
++		int i;
++		if (xperms.specified == AVTAB_XPERMS_IOCTLDRIVER) {
++			for (i = ioctl_driver(low); i <= ioctl_driver(high);
++			     ++i) {
++				if (invert)
++					xperm_clear(i, xperms.perms.p);
++				else
++					xperm_set(i, xperms.perms.p);
++			}
++		} else {
++			for (i = ioctl_func(low); i <= ioctl_func(high); ++i) {
++				if (invert)
++					xperm_clear(i, xperms.perms.p);
++				else
++					xperm_set(i, xperms.perms.p);
++			}
++		}
++
++		node = get_avtab_node(db, &key, &xperms);
++		if (!node) {
++			pr_warn("add_xperm_rule_raw cannot found node!\n");
++			return;
++		}
++		datum = &node->datum;
++
++		if (datum->u.xperms == NULL) {
++			/* 注入在 write_lock_irq 区间内执行，分配走原子路径 */
++			datum->u.xperms =
++				(struct avtab_extended_perms *)(kmalloc(
++					sizeof(xperms), GFP_ATOMIC));
++			if (!datum->u.xperms) {
++				pr_err("alloc xperms failed\n");
++				return;
++			}
++			memcpy(datum->u.xperms, &xperms, sizeof(xperms));
++		}
++	}
++}
++
++static bool add_xperm_rule(struct policydb *db, const char *s, const char *t,
++			   const char *c, const char *range, int effect,
++			   bool invert)
++{
++	struct type_datum *src = NULL, *tgt = NULL;
++	struct class_datum *cls = NULL;
++
++	if (s) {
++		src = symtab_search(&db->p_types, s);
++		if (src == NULL) {
++			pr_info("source type %s does not exist\n", s);
++			return false;
++		}
++	}
++
++	if (t) {
++		tgt = symtab_search(&db->p_types, t);
++		if (tgt == NULL) {
++			pr_info("target type %s does not exist\n", t);
++			return false;
++		}
++	}
++
++	if (c) {
++		cls = symtab_search(&db->p_classes, c);
++		if (cls == NULL) {
++			pr_info("class %s does not exist\n", c);
++			return false;
++		}
++	}
++
++	u16 low, high;
++
++	if (range) {
++		if (strchr(range, '-')) {
++			sscanf(range, "%hx-%hx", &low, &high);
++		} else {
++			sscanf(range, "%hx", &low);
++			high = low;
++		}
++	} else {
++		low = 0;
++		high = 0xFFFF;
++	}
++
++	add_xperm_rule_raw(db, src, tgt, cls, low, high, effect, invert);
++	return true;
++}
++
++static bool add_type_rule(struct policydb *db, const char *s, const char *t,
++			  const char *c, const char *d, int effect)
++{
++	struct type_datum *src, *tgt, *def;
++	struct class_datum *cls;
++
++	src = symtab_search(&db->p_types, s);
++	if (src == NULL) {
++		pr_info("source type %s does not exist\n", s);
++		return false;
++	}
++	tgt = symtab_search(&db->p_types, t);
++	if (tgt == NULL) {
++		pr_info("target type %s does not exist\n", t);
++		return false;
++	}
++	cls = symtab_search(&db->p_classes, c);
++	if (cls == NULL) {
++		pr_info("class %s does not exist\n", c);
++		return false;
++	}
++	def = symtab_search(&db->p_types, d);
++	if (def == NULL) {
++		pr_info("default type %s does not exist\n", d);
++		return false;
++	}
++
++	struct avtab_key key;
++	key.source_type = src->value;
++	key.target_type = tgt->value;
++	key.target_class = cls->value;
++	key.specified = effect;
++
++	struct avtab_node *node = get_avtab_node(db, &key, NULL);
++	if (!node) {
++		pr_err("add_type_rule: cannot get avtab node\n");
++		return false;
++	}
++	node->datum.u.data = def->value;
++
++	return true;
+ }
+ 
+ // 5.9.0 : static inline int hashtab_insert(struct hashtab *h, void *key, void
+@@ -502,299 +486,516 @@ static bool add_type_rule(struct policydb *db, const char *s, const char *t, con
+ #if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)
+ static u32 filenametr_hash(const void *k)
+ {
+-    const struct filename_trans_key *ft = k;
+-    unsigned long hash;
+-    unsigned int byte_num;
+-    unsigned char focus;
++	const struct filename_trans_key *ft = k;
++	unsigned long hash;
++	unsigned int byte_num;
++	unsigned char focus;
+ 
+-    hash = ft->ttype ^ ft->tclass;
++	hash = ft->ttype ^ ft->tclass;
+ 
+-    byte_num = 0;
+-    while ((focus = ft->name[byte_num++]))
+-        hash = partial_name_hash(focus, hash);
+-    return hash;
++	byte_num = 0;
++	while ((focus = ft->name[byte_num++]))
++		hash = partial_name_hash(focus, hash);
++	return hash;
+ }
+ 
+ static int filenametr_cmp(const void *k1, const void *k2)
+ {
+-    const struct filename_trans_key *ft1 = k1;
+-    const struct filename_trans_key *ft2 = k2;
+-    int v;
++	const struct filename_trans_key *ft1 = k1;
++	const struct filename_trans_key *ft2 = k2;
++	int v;
+ 
+-    v = ft1->ttype - ft2->ttype;
+-    if (v)
+-        return v;
++	v = ft1->ttype - ft2->ttype;
++	if (v)
++		return v;
+ 
+-    v = ft1->tclass - ft2->tclass;
+-    if (v)
+-        return v;
++	v = ft1->tclass - ft2->tclass;
++	if (v)
++		return v;
+ 
+-    return strcmp(ft1->name, ft2->name);
++	return strcmp(ft1->name, ft2->name);
+ }
+ 
+ static const struct hashtab_key_params filenametr_key_params = {
+-    .hash = filenametr_hash,
+-    .cmp = filenametr_cmp,
++	.hash = filenametr_hash,
++	.cmp = filenametr_cmp,
+ };
+ #endif
+ 
+-static bool add_filename_trans(struct policydb *db, const char *s, const char *t, const char *c, const char *d,
+-                               const char *o)
+-{
+-    struct type_datum *src, *tgt, *def;
+-    struct class_datum *cls;
+-    struct filename_trans_key *new_key = NULL;
+-    int rc;
+-
+-    src = symtab_search(&db->p_types, s);
+-    if (src == NULL) {
+-        pr_warn("source type %s does not exist\n", s);
+-        return false;
+-    }
+-    tgt = symtab_search(&db->p_types, t);
+-    if (tgt == NULL) {
+-        pr_warn("target type %s does not exist\n", t);
+-        return false;
+-    }
+-    cls = symtab_search(&db->p_classes, c);
+-    if (cls == NULL) {
+-        pr_warn("class %s does not exist\n", c);
+-        return false;
+-    }
+-    def = symtab_search(&db->p_types, d);
+-    if (def == NULL) {
+-        pr_warn("default type %s does not exist\n", d);
+-        return false;
+-    }
+-
+-    struct filename_trans_key key;
+-    key.ttype = tgt->value;
+-    key.tclass = cls->value;
+-    key.name = (char *)o;
+-
+-    struct filename_trans_datum *last = NULL;
+-
+-    struct filename_trans_datum *trans = policydb_filenametr_search(db, &key);
+-    while (trans) {
+-        if (ebitmap_get_bit(&trans->stypes, src->value - 1)) {
+-            // Duplicate, overwrite existing data and return
+-            trans->otype = def->value;
+-            return true;
+-        }
+-        if (trans->otype == def->value)
+-            break;
+-        last = trans;
+-        trans = trans->next;
+-    }
+-
+-    if (trans == NULL) {
+-        trans = (struct filename_trans_datum *)kcalloc(1, sizeof(*trans), GFP_KERNEL);
+-        if (!trans) {
+-            pr_err("add_filename_trans: alloc filename_trans_datum failed\n");
+-            goto out;
+-        }
+-        new_key = (struct filename_trans_key *)kzalloc(sizeof(*new_key), GFP_KERNEL);
+-        if (!new_key) {
+-            pr_err("add_filename_trans: alloc filename_trans_key failed\n");
+-            goto free_trans;
+-        }
+-        *new_key = key;
+-        new_key->name = kstrdup(key.name, GFP_KERNEL);
+-        if (!new_key->name) {
+-            pr_err("add_filename_trans: kstrdup name failed\n");
+-            goto free_key;
+-        }
+-        trans->next = last;
+-        trans->otype = def->value;
+-        rc = hashtab_insert(&db->filename_trans, new_key, trans, filenametr_key_params);
+-        if (rc) {
+-            pr_err("add_filename_trans: hashtab_insert failed: %d\n", rc);
+-            goto free_name;
+-        }
+-    }
+-
+-    db->compat_filename_trans_count++;
+-    return ebitmap_set_bit(&trans->stypes, src->value - 1, 1) == 0;
+-
+-free_name:
+-    kfree(new_key->name);
+-free_key:
+-    kfree(new_key);
+-free_trans:
+-    kfree(trans);
+-out:
+-    return false;
+-}
+-
+-static bool add_genfscon(struct policydb *db, const char *fs_name, const char *path, const char *context)
+-{
+-    return false;
+-}
+-
+-// https://github.com/torvalds/linux/commit/590b9d576caec6b4c46bba49ed36223a399c3fc5#diff-cc9aa90e094e6e0f47bd7300db4f33cf4366b98b55d8753744f31eb69c691016R844-R845
+-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
+-#define ksu_kvrealloc(p, new_size, _old_size) kvrealloc(p, new_size, GFP_KERNEL)
+-// https://github.com/torvalds/linux/commit/de2860f4636256836450c6543be744a50118fc66#diff-fa19cdd9c3369d7f59aa2e8404628109408dbf8e1b568d1157a27328f75b8410R638-R652
+-#elif LINUX_VERSION_CODE >= KERNEL_VERSION(5, 15, 0)
+-#define ksu_kvrealloc(p, new_size, old_size) kvrealloc(p, old_size, new_size, GFP_KERNEL)
++static bool add_filename_trans(struct policydb *db, const char *s,
++			       const char *t, const char *c, const char *d,
++			       const char *o)
++{
++	struct type_datum *src, *tgt, *def;
++	struct class_datum *cls;
++
++	src = symtab_search(&db->p_types, s);
++	if (src == NULL) {
++		pr_warn("source type %s does not exist\n", s);
++		return false;
++	}
++	tgt = symtab_search(&db->p_types, t);
++	if (tgt == NULL) {
++		pr_warn("target type %s does not exist\n", t);
++		return false;
++	}
++	cls = symtab_search(&db->p_classes, c);
++	if (cls == NULL) {
++		pr_warn("class %s does not exist\n", c);
++		return false;
++	}
++	def = symtab_search(&db->p_types, d);
++	if (def == NULL) {
++		pr_warn("default type %s does not exist\n", d);
++		return false;
++	}
++
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 7, 0)
++	struct filename_trans_key key;
++	key.ttype = tgt->value;
++	key.tclass = cls->value;
++	key.name = (char *)o;
++
++	struct filename_trans_datum *last = NULL;
++
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 9, 0)
++	struct filename_trans_datum *trans =
++		policydb_filenametr_search(db, &key);
+ #else
+-// https://cs.android.com/android/_/android/kernel/common/+/f5f3e54f811679761c33526e695bd296190faade
+-// Some 5.10 kernel don't have this backport, so copy one.
+-void *ksu_kvrealloc_compat(const void *p, size_t oldsize, size_t newsize, gfp_t flags)
+-{
+-    void *newp;
+-
+-    if (oldsize >= newsize)
+-        return (void *)p;
+-    newp = kvmalloc(newsize, flags);
+-    if (!newp)
+-        return NULL;
+-    memcpy(newp, p, oldsize);
+-    kvfree(p);
+-    return newp;
+-}
+-#define ksu_kvrealloc(p, new_size, old_size) ksu_kvrealloc_compat(p, old_size, new_size, GFP_KERNEL)
++	struct filename_trans_datum *trans =
++		hashtab_search(&db->filename_trans, &key);
+ #endif
++	while (trans) {
++		if (ebitmap_get_bit(&trans->stypes, src->value - 1)) {
++			// Duplicate, overwrite existing data and return
++			trans->otype = def->value;
++			return true;
++		}
++		if (trans->otype == def->value)
++			break;
++		last = trans;
++		trans = trans->next;
++	}
++
++	if (trans == NULL) {
++		trans = (struct filename_trans_datum *)kcalloc(sizeof(*trans),
++							       1, GFP_ATOMIC);
++		struct filename_trans_key *new_key =
++			(struct filename_trans_key *)kmalloc(sizeof(*new_key),
++							     GFP_ATOMIC);
++		if (!trans || !new_key) {
++			pr_err("add_filename_trans: alloc failed\n");
++			kfree(new_key);
++			kfree(trans);
++			return false;
++		}
++		*new_key = key;
++		new_key->name = kstrdup(key.name, GFP_ATOMIC);
++		if (!new_key->name) {
++			pr_err("add_filename_trans: kstrdup name failed\n");
++			kfree(new_key);
++			kfree(trans);
++			return false;
++		}
++		trans->next = last;
++		trans->otype = def->value;
++		hashtab_insert(&db->filename_trans, new_key, trans,
++			       filenametr_key_params);
++	}
++
++	db->compat_filename_trans_count++;
++	return ebitmap_set_bit(&trans->stypes, src->value - 1, 1) == 0;
++#else // < 5.7.0, has no filename_trans_key, but struct filename_trans
++
++	struct filename_trans key;
++	key.ttype = tgt->value;
++	key.tclass = cls->value;
++	key.name = (char *)o;
++
++	struct filename_trans_datum *trans =
++		hashtab_search(db->filename_trans, &key);
++
++	if (trans == NULL) {
++		trans = (struct filename_trans_datum *)kcalloc(sizeof(*trans),
++							       1, GFP_ATOMIC);
++		if (!trans) {
++			pr_err("add_filename_trans: Failed to alloc datum\n");
++			return false;
++		}
++		struct filename_trans *new_key =
++			(struct filename_trans *)kmalloc(sizeof(*new_key),
++							 GFP_ATOMIC);
++		if (!new_key) {
++			pr_err("add_filename_trans: Failed to alloc new_key\n");
++			return false;
++		}
++		*new_key = key;
++		new_key->name = kstrdup(key.name, GFP_ATOMIC);
++		trans->otype = def->value;
++		hashtab_insert(db->filename_trans, new_key, trans);
++	}
++
++	return ebitmap_set_bit(&db->filename_trans_ttypes, src->value - 1, 1) ==
++	       0;
++#endif
++}
++
++static bool add_genfscon(struct policydb *db, const char *fs_name,
++			 const char *path, const char *context)
++{
++	return false;
++}
++
++static void *ksu_realloc(void *old, size_t new_size, size_t old_size)
++{
++	// we can't use krealloc, because it may be read-only
++	void *new = kzalloc(new_size, GFP_ATOMIC);
++	if (!new) {
++		return NULL;
++	}
++	if (old_size) {
++		memcpy(new, old, old_size);
++	}
++	// we can't use kfree, because it may be read-only
++	// there maybe some leaks, maybe we can check ptr_write, but it's not a big deal
++	// kfree(old);
++	return new;
++}
+ 
+ static bool add_type(struct policydb *db, const char *type_name, bool attr)
+ {
+-    struct type_datum *type = symtab_search(&db->p_types, type_name);
+-    if (type) {
+-        pr_warn("Type %s already exists\n", type_name);
+-        return true;
+-    }
+-
+-    u32 value = ++db->p_types.nprim;
+-    type = (struct type_datum *)kzalloc(sizeof(struct type_datum), GFP_KERNEL);
+-    if (!type) {
+-        pr_err("add_type: alloc type_datum failed.\n");
+-        return false;
+-    }
+-
+-    type->primary = 1;
+-    type->value = value;
+-    type->attribute = attr;
+-
+-    char *key = kstrdup(type_name, GFP_KERNEL);
+-    if (!key) {
+-        pr_err("add_type: alloc key failed.\n");
+-        return false;
+-    }
+-
+-    if (symtab_insert(&db->p_types, key, type)) {
+-        pr_err("add_type: insert symtab failed.\n");
+-        return false;
+-    }
+-
+-    struct ebitmap *new_type_attr_map_array =
+-        ksu_kvrealloc(db->type_attr_map_array, value * sizeof(struct ebitmap), (value - 1) * sizeof(struct ebitmap));
+-
+-    if (!new_type_attr_map_array) {
+-        pr_err("add_type: alloc type_attr_map_array failed\n");
+-        return false;
+-    }
+-
+-    struct type_datum **new_type_val_to_struct = ksu_kvrealloc(
+-        db->type_val_to_struct, sizeof(*db->type_val_to_struct) * value, sizeof(*db->type_val_to_struct) * (value - 1));
+-
+-    if (!new_type_val_to_struct) {
+-        pr_err("add_type: alloc type_val_to_struct failed\n");
+-        return false;
+-    }
+-
+-    char **new_val_to_name_types =
+-        ksu_kvrealloc(db->sym_val_to_name[SYM_TYPES], sizeof(char *) * value, sizeof(char *) * (value - 1));
+-    if (!new_val_to_name_types) {
+-        pr_err("add_type: alloc val_to_name failed\n");
+-        return false;
+-    }
+-
+-    db->type_attr_map_array = new_type_attr_map_array;
+-    ebitmap_init(&db->type_attr_map_array[value - 1]);
+-    ebitmap_set_bit(&db->type_attr_map_array[value - 1], value - 1, 1);
+-
+-    db->type_val_to_struct = new_type_val_to_struct;
+-    db->type_val_to_struct[value - 1] = type;
+-
+-    db->sym_val_to_name[SYM_TYPES] = new_val_to_name_types;
+-    db->sym_val_to_name[SYM_TYPES][value - 1] = key;
+-
+-    int i;
+-    for (i = 0; i < db->p_roles.nprim; ++i) {
+-        ebitmap_set_bit(&db->role_val_to_struct[i]->types, value - 1, 1);
+-    }
+-
+-    return true;
+-}
+-
+-static bool set_type_state(struct policydb *db, const char *type_name, bool permissive)
+-{
+-    struct type_datum *type;
+-    if (type_name == NULL) {
+-        struct hashtab_node *node;
+-        ksu_hashtab_for_each(db->p_types.table, node)
+-        {
+-            type = (struct type_datum *)(node->datum);
+-            if (ebitmap_set_bit(&db->permissive_map, type->value, permissive))
+-                pr_info("Could not set bit in permissive map\n");
+-        };
+-    } else {
+-        type = (struct type_datum *)symtab_search(&db->p_types, type_name);
+-        if (type == NULL) {
+-            pr_info("type %s does not exist\n", type_name);
+-            return false;
+-        }
+-        if (ebitmap_set_bit(&db->permissive_map, type->value, permissive)) {
+-            pr_info("Could not set bit in permissive map\n");
+-            return false;
+-        }
+-    }
+-    return true;
+-}
+-
+-static void add_typeattribute_raw(struct policydb *db, struct type_datum *type, struct type_datum *attr)
+-{
+-    struct ebitmap *sattr = &db->type_attr_map_array[type->value - 1];
+-    ebitmap_set_bit(sattr, attr->value - 1, 1);
+-
+-    struct hashtab_node *node;
+-    struct constraint_node *n;
+-    struct constraint_expr *e;
+-    ksu_hashtab_for_each(db->p_classes.table, node)
+-    {
+-        struct class_datum *cls = (struct class_datum *)(node->datum);
+-        for (n = cls->constraints; n; n = n->next) {
+-            for (e = n->expr; e; e = e->next) {
+-                if (e->expr_type == CEXPR_NAMES && ebitmap_get_bit(&e->type_names->types, attr->value - 1)) {
+-                    ebitmap_set_bit(&e->names, type->value - 1, 1);
+-                }
+-            }
+-        }
+-    };
+-}
+-
+-static bool add_typeattribute(struct policydb *db, const char *type, const char *attr)
+-{
+-    struct type_datum *type_d = symtab_search(&db->p_types, type);
+-    if (type_d == NULL) {
+-        pr_info("type %s does not exist\n", type);
+-        return false;
+-    } else if (type_d->attribute) {
+-        pr_info("type %s is an attribute\n", attr);
+-        return false;
+-    }
+-
+-    struct type_datum *attr_d = symtab_search(&db->p_types, attr);
+-    if (attr_d == NULL) {
+-        pr_info("attribute %s does not exist\n", type);
+-        return false;
+-    } else if (!attr_d->attribute) {
+-        pr_info("type %s is not an attribute \n", attr);
+-        return false;
+-    }
+-
+-    add_typeattribute_raw(db, type_d, attr_d);
+-    return true;
++#ifdef KSU_SUPPORT_ADD_TYPE
++	struct type_datum *type = symtab_search(&db->p_types, type_name);
++	if (type) {
++		pr_warn("Type %s already exists\n", type_name);
++		return true;
++	}
++
++	u32 value = ++db->p_types.nprim;
++	type = (struct type_datum *)kzalloc(sizeof(struct type_datum),
++					    GFP_ATOMIC);
++	if (!type) {
++		pr_err("add_type: alloc type_datum failed.\n");
++		return false;
++	}
++
++	type->primary = 1;
++	type->value = value;
++	type->attribute = attr;
++
++	char *key = kstrdup(type_name, GFP_ATOMIC);
++	if (!key) {
++		pr_err("add_type: alloc key failed.\n");
++		return false;
++	}
++
++	if (symtab_insert(&db->p_types, key, type)) {
++		pr_err("add_type: insert symtab failed.\n");
++		return false;
++	}
++
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0)
++	struct ebitmap *new_type_attr_map_array =
++		ksu_realloc(db->type_attr_map_array,
++			    value * sizeof(struct ebitmap),
++			    (value - 1) * sizeof(struct ebitmap));
++
++	if (!new_type_attr_map_array) {
++		pr_err("add_type: alloc type_attr_map_array failed\n");
++		return false;
++	}
++
++	struct type_datum **new_type_val_to_struct =
++		ksu_realloc(db->type_val_to_struct,
++			    sizeof(*db->type_val_to_struct) * value,
++			    sizeof(*db->type_val_to_struct) * (value - 1));
++
++	if (!new_type_val_to_struct) {
++		pr_err("add_type: alloc type_val_to_struct failed\n");
++		return false;
++	}
++
++	char **new_val_to_name_types =
++		ksu_realloc(db->sym_val_to_name[SYM_TYPES],
++			    sizeof(char *) * value,
++			    sizeof(char *) * (value - 1));
++	if (!new_val_to_name_types) {
++		pr_err("add_type: alloc val_to_name failed\n");
++		return false;
++	}
++
++	db->type_attr_map_array = new_type_attr_map_array;
++	ebitmap_init(&db->type_attr_map_array[value - 1]);
++	ebitmap_set_bit(&db->type_attr_map_array[value - 1], value - 1, 1);
++
++	db->type_val_to_struct = new_type_val_to_struct;
++	db->type_val_to_struct[value - 1] = type;
++
++	db->sym_val_to_name[SYM_TYPES] = new_val_to_name_types;
++	db->sym_val_to_name[SYM_TYPES][value - 1] = key;
++
++	int i;
++	for (i = 0; i < db->p_roles.nprim; ++i) {
++		ebitmap_set_bit(&db->role_val_to_struct[i]->types, value - 1,
++				1);
++	}
++
++	return true;
++#elif defined(CONFIG_IS_HW_HISI)
++	/*
++   * Huawei use type_attr_map and type_val_to_struct.
++   * And use ebitmap not flex_array.
++   */
++	size_t new_size = sizeof(struct ebitmap) * db->p_types.nprim;
++	struct ebitmap *new_type_attr_map =
++		(krealloc(db->type_attr_map, new_size, GFP_ATOMIC));
++
++	struct type_datum **new_type_val_to_struct =
++		krealloc(db->type_val_to_struct,
++			 sizeof(*db->type_val_to_struct) * db->p_types.nprim,
++			 GFP_ATOMIC);
++
++	if (!new_type_attr_map) {
++		pr_err("add_type: alloc type_attr_map failed\n");
++		return false;
++	}
++
++	if (!new_type_val_to_struct) {
++		pr_err("add_type: alloc type_val_to_struct failed\n");
++		return false;
++	}
++
++	char **new_val_to_name_types =
++		krealloc(db->sym_val_to_name[SYM_TYPES],
++			 sizeof(char *) * db->symtab[SYM_TYPES].nprim,
++			 GFP_KERNEL);
++	if (!new_val_to_name_types) {
++		pr_err("add_type: alloc val_to_name failed\n");
++		return false;
++	}
++
++	db->type_attr_map = new_type_attr_map;
++	ebitmap_init(&db->type_attr_map[value - 1], HISI_SELINUX_EBITMAP_RO);
++	ebitmap_set_bit(&db->type_attr_map[value - 1], value - 1, 1);
++
++	db->type_val_to_struct = new_type_val_to_struct;
++	db->type_val_to_struct[value - 1] = type;
++
++	db->sym_val_to_name[SYM_TYPES] = new_val_to_name_types;
++	db->sym_val_to_name[SYM_TYPES][value - 1] = key;
++
++	int i;
++	for (i = 0; i < db->p_roles.nprim; ++i) {
++		ebitmap_set_bit(&db->role_val_to_struct[i]->types, value - 1,
++				1);
++	}
++
++	return true;
++#else
++	// flex_array is not extensible, we need to create a new bigger one instead
++	struct flex_array *new_type_attr_map_array =
++		flex_array_alloc(sizeof(struct ebitmap), db->p_types.nprim,
++				 GFP_ATOMIC | __GFP_ZERO);
++
++	struct flex_array *new_type_val_to_struct =
++		flex_array_alloc(sizeof(struct type_datum *), db->p_types.nprim,
++				 GFP_ATOMIC | __GFP_ZERO);
++
++	struct flex_array *new_val_to_name_types =
++		flex_array_alloc(sizeof(char *), db->symtab[SYM_TYPES].nprim,
++				 GFP_ATOMIC | __GFP_ZERO);
++
++	if (!new_type_attr_map_array) {
++		pr_err("add_type: alloc type_attr_map_array failed\n");
++		return false;
++	}
++
++	if (!new_type_val_to_struct) {
++		pr_err("add_type: alloc type_val_to_struct failed\n");
++		return false;
++	}
++
++	if (!new_val_to_name_types) {
++		pr_err("add_type: alloc val_to_name failed\n");
++		return false;
++	}
++
++	// preallocate so we don't have to worry about the put ever failing
++	if (flex_array_prealloc(new_type_attr_map_array, 0, db->p_types.nprim,
++				GFP_ATOMIC | __GFP_ZERO)) {
++		pr_err("add_type: prealloc type_attr_map_array failed\n");
++		return false;
++	}
++
++	if (flex_array_prealloc(new_type_val_to_struct, 0, db->p_types.nprim,
++				GFP_ATOMIC | __GFP_ZERO)) {
++		pr_err("add_type: prealloc type_val_to_struct_array failed\n");
++		return false;
++	}
++
++	if (flex_array_prealloc(new_val_to_name_types, 0,
++				db->symtab[SYM_TYPES].nprim,
++				GFP_ATOMIC | __GFP_ZERO)) {
++		pr_err("add_type: prealloc val_to_name_types failed\n");
++		return false;
++	}
++
++	int j;
++	void *old_elem;
++	// copy the old data or pointers to new flex arrays
++	for (j = 0; j < db->type_attr_map_array->total_nr_elements; j++) {
++		old_elem = flex_array_get(db->type_attr_map_array, j);
++		if (old_elem)
++			flex_array_put(new_type_attr_map_array, j, old_elem,
++				       GFP_ATOMIC | __GFP_ZERO);
++	}
++
++	for (j = 0; j < db->type_val_to_struct_array->total_nr_elements; j++) {
++		old_elem = flex_array_get_ptr(db->type_val_to_struct_array, j);
++		if (old_elem)
++			flex_array_put_ptr(new_type_val_to_struct, j, old_elem,
++					   GFP_ATOMIC | __GFP_ZERO);
++	}
++
++	for (j = 0; j < db->symtab[SYM_TYPES].nprim; j++) {
++		old_elem =
++			flex_array_get_ptr(db->sym_val_to_name[SYM_TYPES], j);
++		if (old_elem)
++			flex_array_put_ptr(new_val_to_name_types, j, old_elem,
++					   GFP_ATOMIC | __GFP_ZERO);
++	}
++
++	// store the pointer of old flex arrays first, when assigning new ones we
++	// should free it
++	struct flex_array *old_fa;
++
++	old_fa = db->type_attr_map_array;
++	db->type_attr_map_array = new_type_attr_map_array;
++	if (old_fa) {
++		flex_array_free(old_fa);
++	}
++
++	ebitmap_init(flex_array_get(db->type_attr_map_array, value - 1));
++	ebitmap_set_bit(flex_array_get(db->type_attr_map_array, value - 1),
++			value - 1, 1);
++
++	old_fa = db->type_val_to_struct_array;
++	db->type_val_to_struct_array = new_type_val_to_struct;
++	if (old_fa) {
++		flex_array_free(old_fa);
++	}
++	flex_array_put_ptr(db->type_val_to_struct_array, value - 1, type,
++			   GFP_ATOMIC | __GFP_ZERO);
++
++	old_fa = db->sym_val_to_name[SYM_TYPES];
++	db->sym_val_to_name[SYM_TYPES] = new_val_to_name_types;
++	if (old_fa) {
++		flex_array_free(old_fa);
++	}
++	flex_array_put_ptr(db->sym_val_to_name[SYM_TYPES], value - 1, key,
++			   GFP_ATOMIC | __GFP_ZERO);
++
++	int i;
++	for (i = 0; i < db->p_roles.nprim; ++i) {
++		ebitmap_set_bit(&db->role_val_to_struct[i]->types, value - 1,
++				1);
++	}
++	return true;
++#endif
++
++#else
++	return false;
++#endif
++}
++
++static bool set_type_state(struct policydb *db, const char *type_name,
++			   bool permissive)
++{
++	struct type_datum *type;
++	if (type_name == NULL) {
++		struct hashtab_node *node;
++		ksu_hashtab_for_each(db->p_types.table, node)
++		{
++			type = (struct type_datum *)(node->datum);
++			if (ebitmap_set_bit(&db->permissive_map, type->value,
++					    permissive))
++				pr_info("Could not set bit in permissive map\n");
++		};
++	} else {
++		type = (struct type_datum *)symtab_search(&db->p_types,
++							  type_name);
++		if (type == NULL) {
++			pr_info("type %s does not exist\n", type_name);
++			return false;
++		}
++		if (ebitmap_set_bit(&db->permissive_map, type->value,
++				    permissive)) {
++			pr_info("Could not set bit in permissive map\n");
++			return false;
++		}
++	}
++	return true;
++}
++
++static void add_typeattribute_raw(struct policydb *db, struct type_datum *type,
++				  struct type_datum *attr)
++{
++#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 1, 0)
++	struct ebitmap *sattr = &db->type_attr_map_array[type->value - 1];
++#elif defined(CONFIG_IS_HW_HISI)
++	/*
++   *   HISI_SELINUX_EBITMAP_RO is Huawei's unique features.
++   */
++	struct ebitmap *sattr = &db->type_attr_map[type->value - 1],
++		       HISI_SELINUX_EBITMAP_RO;
++#else
++	struct ebitmap *sattr =
++		flex_array_get(db->type_attr_map_array, type->value - 1);
++#endif
++	ebitmap_set_bit(sattr, attr->value - 1, 1);
++
++	struct hashtab_node *node;
++	struct constraint_node *n;
++	struct constraint_expr *e;
++	ksu_hashtab_for_each(db->p_classes.table, node)
++	{
++		struct class_datum *cls = (struct class_datum *)(node->datum);
++		for (n = cls->constraints; n; n = n->next) {
++			for (e = n->expr; e; e = e->next) {
++				if (e->expr_type == CEXPR_NAMES &&
++				    ebitmap_get_bit(&e->type_names->types,
++						    attr->value - 1)) {
++					ebitmap_set_bit(&e->names,
++							type->value - 1, 1);
++				}
++			}
++		}
++	};
++}
++
++static bool add_typeattribute(struct policydb *db, const char *type,
++			      const char *attr)
++{
++	struct type_datum *type_d = symtab_search(&db->p_types, type);
++	if (type_d == NULL) {
++		pr_info("type %s does not exist\n", type);
++		return false;
++	} else if (type_d->attribute) {
++		pr_info("type %s is an attribute\n", attr);
++		return false;
++	}
++
++	struct type_datum *attr_d = symtab_search(&db->p_types, attr);
++	if (attr_d == NULL) {
++		pr_info("attribute %s does not exist\n", type);
++		return false;
++	} else if (!attr_d->attribute) {
++		pr_info("type %s is not an attribute \n", attr);
++		return false;
++	}
++
++	add_typeattribute_raw(db, type_d, attr_d);
++	return true;
+ }
+ 
+ //////////////////////////////////////////////////////////////////////////
+@@ -802,181 +1003,192 @@ static bool add_typeattribute(struct policydb *db, const char *type, const char
+ // Operation on types
+ bool ksu_type(struct policydb *db, const char *name, const char *attr)
+ {
+-    return add_type(db, name, false) && add_typeattribute(db, name, attr);
++	return add_type(db, name, false) && add_typeattribute(db, name, attr);
+ }
+ 
+ bool ksu_attribute(struct policydb *db, const char *name)
+ {
+-    return add_type(db, name, true);
++	return add_type(db, name, true);
+ }
+ 
+ bool ksu_permissive(struct policydb *db, const char *type)
+ {
+-    return set_type_state(db, type, true);
++	return set_type_state(db, type, true);
+ }
+ 
+ bool ksu_enforce(struct policydb *db, const char *type)
+ {
+-    return set_type_state(db, type, false);
++	return set_type_state(db, type, false);
+ }
+ 
+ bool ksu_typeattribute(struct policydb *db, const char *type, const char *attr)
+ {
+-    return add_typeattribute(db, type, attr);
++	return add_typeattribute(db, type, attr);
+ }
+ 
+ bool ksu_exists(struct policydb *db, const char *type)
+ {
+-    return symtab_search(&db->p_types, type) != NULL;
++	return symtab_search(&db->p_types, type) != NULL;
+ }
+ 
+ // Access vector rules
+-bool ksu_allow(struct policydb *db, const char *src, const char *tgt, const char *cls, const char *perm)
++bool ksu_allow(struct policydb *db, const char *src, const char *tgt,
++	       const char *cls, const char *perm)
+ {
+-    return add_rule(db, src, tgt, cls, perm, AVTAB_ALLOWED, false);
++	return add_rule(db, src, tgt, cls, perm, AVTAB_ALLOWED, false);
+ }
+ 
+-bool ksu_deny(struct policydb *db, const char *src, const char *tgt, const char *cls, const char *perm)
++bool ksu_deny(struct policydb *db, const char *src, const char *tgt,
++	      const char *cls, const char *perm)
+ {
+-    return add_rule(db, src, tgt, cls, perm, AVTAB_ALLOWED, true);
++	return add_rule(db, src, tgt, cls, perm, AVTAB_ALLOWED, true);
+ }
+ 
+-bool ksu_auditallow(struct policydb *db, const char *src, const char *tgt, const char *cls, const char *perm)
++bool ksu_auditallow(struct policydb *db, const char *src, const char *tgt,
++		    const char *cls, const char *perm)
+ {
+-    return add_rule(db, src, tgt, cls, perm, AVTAB_AUDITALLOW, false);
++	return add_rule(db, src, tgt, cls, perm, AVTAB_AUDITALLOW, false);
+ }
+-bool ksu_dontaudit(struct policydb *db, const char *src, const char *tgt, const char *cls, const char *perm)
++bool ksu_dontaudit(struct policydb *db, const char *src, const char *tgt,
++		   const char *cls, const char *perm)
+ {
+-    return add_rule(db, src, tgt, cls, perm, AVTAB_AUDITDENY, true);
++	return add_rule(db, src, tgt, cls, perm, AVTAB_AUDITDENY, true);
+ }
+ 
+ // Extended permissions access vector rules
+-bool ksu_allowxperm(struct policydb *db, const char *src, const char *tgt, const char *cls, const char *range)
++bool ksu_allowxperm(struct policydb *db, const char *src, const char *tgt,
++		    const char *cls, const char *range)
+ {
+-    return add_xperm_rule(db, src, tgt, cls, range, AVTAB_XPERMS_ALLOWED, false);
++	return add_xperm_rule(db, src, tgt, cls, range, AVTAB_XPERMS_ALLOWED,
++			      false);
+ }
+ 
+-bool ksu_auditallowxperm(struct policydb *db, const char *src, const char *tgt, const char *cls, const char *range)
++bool ksu_auditallowxperm(struct policydb *db, const char *src, const char *tgt,
++			 const char *cls, const char *range)
+ {
+-    return add_xperm_rule(db, src, tgt, cls, range, AVTAB_XPERMS_AUDITALLOW, false);
++	return add_xperm_rule(db, src, tgt, cls, range, AVTAB_XPERMS_AUDITALLOW,
++			      false);
+ }
+ 
+-bool ksu_dontauditxperm(struct policydb *db, const char *src, const char *tgt, const char *cls, const char *range)
++bool ksu_dontauditxperm(struct policydb *db, const char *src, const char *tgt,
++			const char *cls, const char *range)
+ {
+-    return add_xperm_rule(db, src, tgt, cls, range, AVTAB_XPERMS_DONTAUDIT, false);
++	return add_xperm_rule(db, src, tgt, cls, range, AVTAB_XPERMS_DONTAUDIT,
++			      false);
+ }
+ 
+ // Type rules
+-bool ksu_type_transition(struct policydb *db, const char *src, const char *tgt, const char *cls, const char *def,
+-                         const char *obj)
++bool ksu_type_transition(struct policydb *db, const char *src, const char *tgt,
++			 const char *cls, const char *def, const char *obj)
+ {
+-    if (obj) {
+-        return add_filename_trans(db, src, tgt, cls, def, obj);
+-    } else {
+-        return add_type_rule(db, src, tgt, cls, def, AVTAB_TRANSITION);
+-    }
++	if (obj) {
++		return add_filename_trans(db, src, tgt, cls, def, obj);
++	} else {
++		return add_type_rule(db, src, tgt, cls, def, AVTAB_TRANSITION);
++	}
+ }
+ 
+-bool ksu_type_change(struct policydb *db, const char *src, const char *tgt, const char *cls, const char *def)
++bool ksu_type_change(struct policydb *db, const char *src, const char *tgt,
++		     const char *cls, const char *def)
+ {
+-    return add_type_rule(db, src, tgt, cls, def, AVTAB_CHANGE);
++	return add_type_rule(db, src, tgt, cls, def, AVTAB_CHANGE);
+ }
+ 
+-bool ksu_type_member(struct policydb *db, const char *src, const char *tgt, const char *cls, const char *def)
++bool ksu_type_member(struct policydb *db, const char *src, const char *tgt,
++		     const char *cls, const char *def)
+ {
+-    return add_type_rule(db, src, tgt, cls, def, AVTAB_MEMBER);
++	return add_type_rule(db, src, tgt, cls, def, AVTAB_MEMBER);
+ }
+ 
+ // File system labeling
+-bool ksu_genfscon(struct policydb *db, const char *fs_name, const char *path, const char *ctx)
+-{
+-    return add_genfscon(db, fs_name, path, ctx);
+-}
+-
+-// ======== sepolicy ========
+-
+-void ksu_destroy_sepolicy(struct selinux_policy *pol)
+-{
+-    policydb_destroy(&pol->policydb);
+-    kfree(pol);
+-}
+-
+-struct selinux_policy *ksu_dup_sepolicy(struct selinux_policy *old_pol)
+-{
+-    int ret;
+-    size_t len;
+-    struct selinux_policy *new_pol;
+-    void *data;
+-    struct policy_file fp;
+-
+-    // Some device policy db seems not marking type itself in type_attr_map_array
+-    // policydb_read() adds each type to its own attribute map, so old_pol->policydb.len may be smaller
+-    // preserve one ebitmap entry for this condition to avoid trigger -EINVAL
+-    len = old_pol->policydb.len + (size_t)old_pol->policydb.p_types.nprim * (sizeof(u32) + sizeof(u64));
+-
+-    data = vmalloc(len);
+-    if (!data) {
+-        pr_err("alloc policy buffer len %zu\n", len);
+-        ret = -ENOMEM;
+-        goto out_free_data;
+-    }
+-
+-    fp.data = data;
+-    fp.len = len;
+-
+-    ret = policydb_write(&old_pol->policydb, &fp);
+-    if (ret) {
+-        pr_err("sepolicy: policydb_write: %d\n", ret);
+-        goto out_free_data;
+-    }
+-    len -= fp.len;
+-    // https://android.googlesource.com/kernel/common/+/35a7845718734ae638b85b420534cb859498dab6%5E%21
+-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 18, 0)
+-    // https://android-review.googlesource.com/c/kernel/common/+/3009995/11/security/selinux/ss/policydb.c
+-    // fixup config
+-    // 4*2+8+4
+-    static const size_t kConfigOff = 20;
+-    if (len >= kConfigOff + sizeof(u32)) {
+-        u32 *config_ptr = (u32 *)((unsigned long)data + kConfigOff);
+-        pr_info("old config: %u\n", *config_ptr);
+-        if (old_pol->policydb.android_netlink_route) {
+-            pr_info("adding POLICYDB_CONFIG_ANDROID_NETLINK_ROUTE\n");
+-            *config_ptr |= POLICYDB_CONFIG_ANDROID_NETLINK_ROUTE;
+-        }
+-        if (old_pol->policydb.android_netlink_getneigh) {
+-            pr_info("adding POLICYDB_CONFIG_ANDROID_NETLINK_GETNEIGH\n");
+-            *config_ptr |= POLICYDB_CONFIG_ANDROID_NETLINK_GETNEIGH;
+-        }
+-        pr_info("new config: %u\n", *config_ptr);
+-    }
+-#endif
+-    new_pol = kmemdup(old_pol, sizeof(*old_pol), GFP_KERNEL);
+-    if (!new_pol) {
+-        ret = -ENOMEM;
+-        pr_err("sepolicy: dup old pol\n");
+-        goto out_free_data;
+-    }
+-    memset(&new_pol->policydb, 0, sizeof(new_pol->policydb));
+-
+-    // rewind fp
+-    fp.data = data;
+-    fp.len = len;
+-
+-    ret = policydb_read(&new_pol->policydb, &fp);
+-    if (ret) {
+-        pr_err("sepolicy: policydb_read: %d\n", ret);
+-        goto out_free_policydb;
+-    }
+-    new_pol->policydb.len = len;
+-    kvfree(data);
+-
+-    return new_pol;
+-
+-out_free_policydb:
+-    kfree(new_pol);
++bool ksu_genfscon(struct policydb *db, const char *fs_name, const char *path,
++		  const char *ctx)
++{
++	return add_genfscon(db, fs_name, path, ctx);
++}
+ 
+-out_free_data:
+-    kvfree(data);
++#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
++/*
++ * 4.19 的 policydb_read() 会把每个类型自己补进 type_attr_map，内存里的策略
++ * 序列化出来可能比原始文件更长。按每个类型多一个 ebitmap 节点（u32 起始位
++ * 加 u64 位图）预留空间：4.19 的 put_entry() 没有边界检查，容量不够会直接写坏
++ * vmalloc 缓冲区。
++ */
++struct ksu_sepolicy_backup *ksu_dup_sepolicy_backup(struct policydb *db,
++						    u32 latest_granting)
++{
++	struct ksu_sepolicy_backup *backup;
++	struct policy_file fp;
++	void *data;
++	size_t size, written;
++	int rc;
++
++	if (!db->policyvers)
++		return ERR_PTR(-EINVAL);
++
++	size = db->len + (size_t)db->p_types.nprim * (sizeof(u32) + sizeof(u64)) + 4096;
++	data = vmalloc(size);
++	if (!data)
++		return ERR_PTR(-ENOMEM);
++
++	fp.data = data;
++	fp.len = size;
++	rc = policydb_write(db, &fp);
++	if (rc) {
++		pr_err("sepolicy: policydb_write: %d\n", rc);
++		goto err_free_data;
++	}
++	written = size - fp.len;
++
++	backup = kzalloc(sizeof(*backup), GFP_KERNEL);
++	if (!backup) {
++		rc = -ENOMEM;
++		goto err_free_data;
++	}
++
++	backup->sidtab = kzalloc(sizeof(*backup->sidtab), GFP_KERNEL);
++	if (!backup->sidtab) {
++		rc = -ENOMEM;
++		goto err_free_backup;
++	}
++
++	/* policydb_read() 失败时已自行调用 policydb_destroy() */
++	fp.data = data;
++	fp.len = written;
++	rc = policydb_read(&backup->policydb, &fp);
++	if (rc) {
++		pr_err("sepolicy: policydb_read: %d\n", rc);
++		goto err_free_sidtab;
++	}
++	backup->policydb.len = written;
++
++	rc = policydb_load_isids(&backup->policydb, backup->sidtab);
++	if (rc) {
++		pr_err("sepolicy: policydb_load_isids: %d\n", rc);
++		policydb_destroy(&backup->policydb);
++		goto err_free_sidtab;
++	}
++
++	backup->latest_granting = latest_granting;
++	vfree(data);
++	return backup;
++
++err_free_sidtab:
++	kfree(backup->sidtab);
++err_free_backup:
++	kfree(backup);
++err_free_data:
++	vfree(data);
++	return ERR_PTR(rc);
++}
+ 
+-    return ERR_PTR(ret);
++void ksu_destroy_sepolicy_backup(struct ksu_sepolicy_backup *backup)
++{
++	if (!backup)
++		return;
++	sidtab_destroy(backup->sidtab);
++	kfree(backup->sidtab);
++	policydb_destroy(&backup->policydb);
++	kfree(backup);
+ }
++#endif
+diff --git a/kernel/selinux/sepolicy.h b/kernel/selinux/sepolicy.h
+index ed85b93d..146c33ba 100644
+--- a/kernel/selinux/sepolicy.h
++++ b/kernel/selinux/sepolicy.h
+@@ -1,13 +1,30 @@
+ #ifndef __KSU_H_SEPOLICY
+ #define __KSU_H_SEPOLICY
+ 
+-#include <linux/types.h>
++#include "linux/types.h"
++#include "linux/version.h"
+ 
+ #include "ss/policydb.h"
+ 
+-struct selinux_policy *ksu_dup_sepolicy(struct selinux_policy *old_pol);
++/*
++ * 4.19 没有 selinux_policy 容器：策略与 sidtab 直接挂在 selinux_state.ss 上，
++ * KSU 的规则由 apply_kernelsu_rules() 原地注入。selinux_hide 需要注入前的原始
++ * 策略来回答普通应用的查询，这里自建一个只读快照容器。
++ */
++#if LINUX_VERSION_CODE < KERNEL_VERSION(5, 10, 0)
++#include "ss/sidtab.h"
+ 
+-void ksu_destroy_sepolicy(struct selinux_policy *orig);
++struct ksu_sepolicy_backup {
++	struct policydb policydb;
++	struct sidtab *sidtab;
++	u32 latest_granting;
++};
++
++/* 序列化-反序列化复制一份策略，sidtab 只装载初始 SID */
++struct ksu_sepolicy_backup *ksu_dup_sepolicy_backup(struct policydb *db, u32 latest_granting);
++
++void ksu_destroy_sepolicy_backup(struct ksu_sepolicy_backup *backup);
++#endif
+ 
+ // Operation on types
+ bool ksu_type(struct policydb *db, const char *name, const char *attr);
+@@ -18,23 +35,33 @@ bool ksu_typeattribute(struct policydb *db, const char *type, const char *attr);
+ bool ksu_exists(struct policydb *db, const char *type);
+ 
+ // Access vector rules
+-bool ksu_allow(struct policydb *db, const char *src, const char *tgt, const char *cls, const char *perm);
+-bool ksu_deny(struct policydb *db, const char *src, const char *tgt, const char *cls, const char *perm);
+-bool ksu_auditallow(struct policydb *db, const char *src, const char *tgt, const char *cls, const char *perm);
+-bool ksu_dontaudit(struct policydb *db, const char *src, const char *tgt, const char *cls, const char *perm);
++bool ksu_allow(struct policydb *db, const char *src, const char *tgt,
++	       const char *cls, const char *perm);
++bool ksu_deny(struct policydb *db, const char *src, const char *tgt,
++	      const char *cls, const char *perm);
++bool ksu_auditallow(struct policydb *db, const char *src, const char *tgt,
++		    const char *cls, const char *perm);
++bool ksu_dontaudit(struct policydb *db, const char *src, const char *tgt,
++		   const char *cls, const char *perm);
+ 
+ // Extended permissions access vector rules
+-bool ksu_allowxperm(struct policydb *db, const char *src, const char *tgt, const char *cls, const char *range);
+-bool ksu_auditallowxperm(struct policydb *db, const char *src, const char *tgt, const char *cls, const char *range);
+-bool ksu_dontauditxperm(struct policydb *db, const char *src, const char *tgt, const char *cls, const char *range);
++bool ksu_allowxperm(struct policydb *db, const char *src, const char *tgt,
++		    const char *cls, const char *range);
++bool ksu_auditallowxperm(struct policydb *db, const char *src, const char *tgt,
++			 const char *cls, const char *range);
++bool ksu_dontauditxperm(struct policydb *db, const char *src, const char *tgt,
++			const char *cls, const char *range);
+ 
+ // Type rules
+-bool ksu_type_transition(struct policydb *db, const char *src, const char *tgt, const char *cls, const char *def,
+-                         const char *obj);
+-bool ksu_type_change(struct policydb *db, const char *src, const char *tgt, const char *cls, const char *def);
+-bool ksu_type_member(struct policydb *db, const char *src, const char *tgt, const char *cls, const char *def);
++bool ksu_type_transition(struct policydb *db, const char *src, const char *tgt,
++			 const char *cls, const char *def, const char *obj);
++bool ksu_type_change(struct policydb *db, const char *src, const char *tgt,
++		     const char *cls, const char *def);
++bool ksu_type_member(struct policydb *db, const char *src, const char *tgt,
++		     const char *cls, const char *def);
+ 
+ // File system labeling
+-bool ksu_genfscon(struct policydb *db, const char *fs_name, const char *path, const char *ctx);
++bool ksu_genfscon(struct policydb *db, const char *fs_name, const char *path,
++		  const char *ctx);
+ 
+ #endif
+diff --git a/kernel/sulog/event.c b/kernel/sulog/event.c
+index 51d6fa84..dd75195f 100644
+--- a/kernel/sulog/event.c
++++ b/kernel/sulog/event.c
+@@ -2,7 +2,7 @@
+ #include <linux/compat.h>
+ #include <linux/cred.h>
+ #include <linux/gfp.h>
+-#include <linux/minmax.h>
++#include <linux/kernel.h>
+ #include <linux/overflow.h>
+ #include <linux/sched/signal.h>
+ #include <linux/slab.h>
+diff --git a/kernel/supercall/dispatch.c b/kernel/supercall/dispatch.c
+index 82ac7003..010d23fc 100644
+--- a/kernel/supercall/dispatch.c
++++ b/kernel/supercall/dispatch.c
+@@ -1,5 +1,7 @@
+ #include <linux/capability.h>
+ #include <linux/cred.h>
++#include <linux/sched/signal.h>
++#include <linux/sched/task.h>
+ #include <linux/slab.h>
+ #include <linux/uaccess.h>
+ #include <linux/version.h>

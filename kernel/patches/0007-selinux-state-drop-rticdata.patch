@@ -1,0 +1,16 @@
+--- a/security/selinux/hooks.c
++++ b/security/selinux/hooks.c
+@@ -100,7 +100,12 @@
+ #include "audit.h"
+ #include "avc_ss.h"
+ 
+-struct selinux_state selinux_state __rticdata;
++/*
++ * 原厂把该变量放在 .bss.rtic 段，独立 kbuild 链接时该段可能被放到距
++ * .text 超过 4 GiB 的位置，ADR_PREL_PG_HI21 重定位溢出。该段没有运行时
++ * 引用，放回普通 .bss。
++ */
++struct selinux_state selinux_state;
+ 
+  /* SECMARK reference count */
+ static atomic_t selinux_secmark_refcount = ATOMIC_INIT(0);

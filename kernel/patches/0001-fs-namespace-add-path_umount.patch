@@ -1,0 +1,48 @@
+--- a/fs/namespace.c
++++ b/fs/namespace.c
+@@ -1642,6 +1642,45 @@
+ }
+ 
+ /*
++ * KernelSU 非 GKI 集成：从 5.9 回移 path_umount()，供 kernel_umount 特性使用。
++ * 5.9 与本树的 do_umount() 都要求调用者之外不持有 namespace_sem，
++ * 因此这里直接复用 ksys_umount() 的判定顺序与收尾方式。
++ */
++static int can_umount(const struct path *path, int flags)
++{
++	struct mount *mnt = real_mount(path->mnt);
++
++	if (flags & ~(MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW))
++		return -EINVAL;
++	if (!may_mount())
++		return -EPERM;
++	if (path->dentry != path->mnt->mnt_root)
++		return -EINVAL;
++	if (!check_mnt(mnt))
++		return -EINVAL;
++	if (mnt->mnt.mnt_flags & MNT_LOCKED) /* Check optimistically */
++		return -EINVAL;
++	if (flags & MNT_FORCE && !capable(CAP_SYS_ADMIN))
++		return -EPERM;
++	return 0;
++}
++
++int path_umount(struct path *path, int flags)
++{
++	struct mount *mnt = real_mount(path->mnt);
++	int ret;
++
++	ret = can_umount(path, flags);
++	if (!ret)
++		ret = do_umount(mnt, flags);
++
++	/* we mustn't call path_put() as that would clear mnt_expiry_mark */
++	dput(path->dentry);
++	mntput_no_expire(mnt);
++	return ret;
++}
++
++/*
+  * Now umount can handle mount points as well as block devices.
+  * This is important for filesystems which use unnamed block devices.
+  *
